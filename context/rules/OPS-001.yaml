@@ -1,0 +1,26 @@
+rule_id: OPS-001
+title: "Instrumentação Datadog ausente"
+pillar: Operacional
+severity: medium
+why: |
+  Sem labels de unified service tagging, o serviço não aparece no APM do Datadog com
+  correlação correta entre traces, métricas e logs. SLOs automáticos não podem ser
+  configurados pelo operator. Alertas baseados em erros do serviço ficam sem contexto.
+impact: "Serviço invisível no APM; impossível correlacionar traces com logs e métricas no Datadog."
+fix_hint: |
+  Adicione as três labels obrigatórias de unified service tagging ao spec.template.metadata.labels.
+  Adicione também a label de admission controller para injeção automática do agente APM.
+yaml_example: |
+  spec:
+    template:
+      metadata:
+        labels:
+          app: my-service
+          tags.datadoghq.com/service: "my-service"
+          tags.datadoghq.com/env: "production"
+          tags.datadoghq.com/version: "v1.2.3"
+          admission.datadoghq.com/enabled: "true"
+        annotations:
+          admission.datadoghq.com/java-lib.version: "latest"
+tags: [datadog, observabilidade, apm, unified-service-tagging, instrumentação, slo]
+related_rules: []

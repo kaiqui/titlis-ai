@@ -1,0 +1,23 @@
+rule_id: PERF-002
+title: "HPA CPU target muito alto"
+pillar: Performance
+severity: medium
+why: |
+  Com target de CPU acima de 80%, o HPA só adiciona réplicas quando os pods existentes
+  já estão sobrecarregados. O scale-up leva 30-90 segundos para ser efetivo — nesse intervalo
+  os pods saturados degradam latência e podem começar a rejeitar requisições.
+impact: "Latência elevada e possível rejeição de requests durante o lag de scale-up."
+fix_hint: |
+  Configure targetCPUUtilizationPercentage entre 50% e 70%. Isso garante headroom para
+  absorver picos súbitos de tráfego antes que o scale-up seja necessário.
+yaml_example: |
+  spec:
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 60  # não use acima de 70%
+tags: [hpa, performance, cpu-target, latência, scale-up, headroom]
+related_rules: [RES-007, RES-008, PERF-003]

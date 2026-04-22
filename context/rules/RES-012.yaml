@@ -1,0 +1,38 @@
+rule_id: RES-012
+title: "NetworkPolicy não aplicada"
+pillar: Resiliência
+severity: medium
+why: |
+  Sem NetworkPolicy, o pod aceita conexões de qualquer outro pod no cluster por padrão.
+  Um pod comprometido pode lateralizar para bancos de dados, serviços internos e APIs
+  administrativas sem nenhuma barreira de rede — violação de least-privilege na camada L3/L4.
+impact: "Movimento lateral irrestrito em caso de comprometimento de qualquer pod no cluster."
+fix_hint: |
+  Crie NetworkPolicy com ingress permitindo apenas os pods que precisam chamar este serviço,
+  e egress permitindo apenas os destinos necessários (banco, APIs externas via CIDR).
+yaml_example: |
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: app-netpol
+  spec:
+    podSelector:
+      matchLabels:
+        app: my-app
+    policyTypes: [Ingress, Egress]
+    ingress:
+      - from:
+          - podSelector:
+              matchLabels:
+                app: api-gateway
+        ports:
+          - port: 8080
+    egress:
+      - to:
+          - podSelector:
+              matchLabels:
+                app: postgres
+        ports:
+          - port: 5432
+tags: [segurança, networkpolicy, lateral-movement, least-privilege, ingress, egress]
+related_rules: []

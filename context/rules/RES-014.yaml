@@ -1,0 +1,23 @@
+rule_id: RES-014
+title: "Estratégia de rollout não configurada"
+pillar: Resiliência
+severity: medium
+why: |
+  Sem estratégia de rollout explícita, Kubernetes usa o default Recreate em alguns casos,
+  que derruba todos os pods antigos antes de criar os novos — causando downtime total.
+  Mesmo com RollingUpdate como default, sem maxUnavailable: 0 pods podem ser terminados
+  antes dos novos estarem prontos.
+impact: "Downtime durante deploys e possível rollback manual necessário."
+fix_hint: |
+  Use RollingUpdate com maxUnavailable: 0 (zero pods fora do ar) e maxSurge: 1 (um pod
+  extra durante o deploy). Combine com readinessProbe (RES-002) para garantir que novos
+  pods estejam prontos antes de terminar os antigos.
+yaml_example: |
+  spec:
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 0
+        maxSurge: 1
+tags: [rollout, deploy, rolling-update, zero-downtime, estratégia]
+related_rules: [RES-002, RES-009]

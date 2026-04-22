@@ -1,0 +1,22 @@
+rule_id: RES-004
+title: "CPU Limits não definido"
+pillar: Resiliência
+severity: medium
+why: |
+  Sem cpu limits, um pod pode monopolizar toda a CPU do nó. Isso degrada todos os outros
+  workloads no mesmo nó. Em casos de bug ou loop infinito, um único pod pode causar
+  cascata de falhas em serviços não relacionados.
+impact: "Noisy-neighbor: degradação de latência em múltiplos serviços no mesmo nó."
+fix_hint: |
+  Defina resources.limits.cpu entre 2x e 4x o valor de requests.
+  Evite ratios acima de 4x pois causam CPU throttling inesperado sob carga (ver PERF-001).
+yaml_example: |
+  containers:
+    - name: app
+      resources:
+        requests:
+          cpu: "200m"
+        limits:
+          cpu: "500m"
+tags: [resources, limits, noisy-neighbor, throttling, cpu]
+related_rules: [RES-003, PERF-001]

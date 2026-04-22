@@ -1,0 +1,29 @@
+rule_id: SEC-002
+title: "Root filesystem não é read-only"
+pillar: Segurança
+severity: high
+why: |
+  Filesystem gravável permite que código malicioso injetado via RCE modifique binários
+  do sistema, instale backdoors ou persista malware através de restarts do container.
+  Também facilita a exfiltração de dados para arquivos locais acessíveis via exec.
+impact: "Atacante com RCE pode persistir malware, modificar binários e estabelecer backdoor."
+fix_hint: |
+  Configure readOnlyRootFilesystem: true e monte emptyDir para os diretórios que
+  precisam de escrita (tmp, logs, pid files). Use a imagem mínima possível.
+yaml_example: |
+  containers:
+    - name: app
+      securityContext:
+        readOnlyRootFilesystem: true
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: var-run
+          mountPath: /var/run
+  volumes:
+    - name: tmp
+      emptyDir: {}
+    - name: var-run
+      emptyDir: {}
+tags: [segurança, filesystem, read-only, malware, hardening]
+related_rules: [RES-010, RES-011, SEC-003]

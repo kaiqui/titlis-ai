@@ -1,0 +1,22 @@
+rule_id: RES-005
+title: "Memory Requests não definido"
+pillar: Resiliência
+severity: high
+why: |
+  Sem memory requests, o scheduler pode alocar o pod em nós com memória insuficiente.
+  Quando a memória do nó se esgota, o OOM Killer do kernel termina processos arbitrariamente,
+  podendo impactar pods de outros serviços além do responsável pelo consumo.
+impact: "OOM Kill imprevisto no nó afetando múltiplos pods, não apenas o infrator."
+fix_hint: |
+  Defina resources.requests.memory com o consumo típico da aplicação (ex: 128Mi-512Mi).
+  Use métricas de Working Set Memory do Datadog/Prometheus para calibrar o valor.
+yaml_example: |
+  containers:
+    - name: app
+      resources:
+        requests:
+          memory: "256Mi"
+        limits:
+          memory: "512Mi"
+tags: [resources, memory, oom, scheduler, qos]
+related_rules: [RES-006, RES-003]

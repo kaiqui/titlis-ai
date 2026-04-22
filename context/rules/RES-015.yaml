@@ -1,0 +1,24 @@
+rule_id: RES-015
+title: "PodDisruptionBudget não configurado"
+pillar: Resiliência
+severity: medium
+why: |
+  Sem PDB, operações de manutenção (kubectl drain, upgrades de nó, Cluster Autoscaler)
+  podem evacuar todos os pods simultaneamente. O Kubernetes não tem como saber quantos
+  pods podem ser interrompidos de forma segura sem violar a disponibilidade do serviço.
+impact: "Downtime completo durante manutenções de nó ou upgrades do cluster."
+fix_hint: |
+  Crie PodDisruptionBudget com minAvailable: 1 (ou maxUnavailable: 1) para garantir
+  que ao menos uma réplica permaneça durante operações disruptivas.
+yaml_example: |
+  apiVersion: policy/v1
+  kind: PodDisruptionBudget
+  metadata:
+    name: app-pdb
+  spec:
+    minAvailable: 1
+    selector:
+      matchLabels:
+        app: my-app
+tags: [pdb, disponibilidade, manutenção, drain, cluster-autoscaler]
+related_rules: [RES-013]

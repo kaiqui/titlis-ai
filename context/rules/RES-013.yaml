@@ -1,0 +1,28 @@
+rule_id: RES-013
+title: "Réplicas insuficientes"
+pillar: Resiliência
+severity: high
+why: |
+  Com apenas 1 réplica, qualquer falha de nó, eviction ou restart do pod causa downtime total.
+  Mesmo com HPA configurado, o scale-up leva 30-90s — tempo suficiente para SLOs de
+  disponibilidade serem violados. Rolling updates também causam momentos de zero réplicas.
+impact: "SPOF: falha de um único nó derruba o serviço completamente."
+fix_hint: |
+  Configure spec.replicas: 2 como mínimo. Adicione PodAntiAffinity para garantir que
+  as réplicas fiquem em nós físicos diferentes, eliminando o SPOF no nível de nó.
+yaml_example: |
+  spec:
+    replicas: 2
+    template:
+      spec:
+        affinity:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  labelSelector:
+                    matchLabels:
+                      app: my-app
+                  topologyKey: kubernetes.io/hostname
+tags: [resiliência, replicas, spof, disponibilidade, anti-affinity]
+related_rules: [RES-015, RES-016]

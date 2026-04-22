@@ -1,0 +1,25 @@
+rule_id: RES-016
+title: "HPA com réplicas mínimas insuficientes"
+pillar: Resiliência
+severity: medium
+why: |
+  HPA com minReplicas: 1 permite ao cluster reduzir o deployment para um único pod em
+  baixa carga. Isso cria um SPOF silencioso fora do horário de pico — exatamente quando
+  a equipe não está monitorando. Um restart ou eviction derruba o serviço completamente.
+impact: "SPOF em baixa carga: pod único pode ser evictado sem alertas imediatos."
+fix_hint: |
+  Configure hpa.spec.minReplicas: 2 ou mais. Isso garante alta disponibilidade mesmo
+  durante períodos de baixa utilização, sem custo significativo de recursos.
+yaml_example: |
+  spec:
+    minReplicas: 2
+    maxReplicas: 10
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 60
+tags: [hpa, minreplicas, spof, disponibilidade, resiliência]
+related_rules: [RES-007, RES-013]

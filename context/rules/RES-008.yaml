@@ -1,0 +1,28 @@
+rule_id: RES-008
+title: "HPA sem métricas configuradas"
+pillar: Resiliência
+severity: high
+why: |
+  Um HPA sem métricas definidas não sabe quando escalar. O controller ignora o recurso
+  e o scaling nunca ocorre, dando falsa sensação de proteção. É equivalente a não ter HPA.
+impact: "Escalonamento automático silenciosamente desabilitado apesar do HPA existir."
+fix_hint: |
+  Adicione ao menos uma métrica ao spec.metrics. CPU utilization é o ponto de partida.
+  Para serviços stateful ou com workloads assíncronos, adicione métricas customizadas.
+yaml_example: |
+  spec:
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 60
+      - type: Resource
+        resource:
+          name: memory
+          target:
+            type: Utilization
+            averageUtilization: 70
+tags: [hpa, autoscaling, métricas, scaling, configuração]
+related_rules: [RES-007, PERF-002, PERF-003]

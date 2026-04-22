@@ -1,0 +1,33 @@
+rule_id: RES-007
+title: "HPA não configurado"
+pillar: Resiliência
+severity: medium
+why: |
+  Sem HorizontalPodAutoscaler, o número de réplicas é fixo. Picos de tráfego causam
+  degradação de latência ou timeouts enquanto a equipe escala manualmente.
+  Vales de tráfego desperdiçam recursos com réplicas ociosas.
+impact: "Latência elevada ou timeouts durante picos sem escala automática."
+fix_hint: |
+  Crie um HPA referenciando o Deployment com minReplicas e maxReplicas definidos.
+  Configure métricas de CPU (50-70%) e/ou memória como target de scaling.
+yaml_example: |
+  apiVersion: autoscaling/v2
+  kind: HorizontalPodAutoscaler
+  metadata:
+    name: app-hpa
+  spec:
+    scaleTargetRef:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: app
+    minReplicas: 2
+    maxReplicas: 10
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 60
+tags: [hpa, autoscaling, resiliência, scaling, capacity]
+related_rules: [RES-008, RES-016, RES-017, RES-018, RES-019, PERF-002, PERF-003]

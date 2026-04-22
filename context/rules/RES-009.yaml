@@ -1,0 +1,24 @@
+rule_id: RES-009
+title: "Graceful Shutdown não configurado"
+pillar: Resiliência
+severity: medium
+why: |
+  Sem terminationGracePeriodSeconds adequado, o Kubernetes envia SIGKILL ao processo
+  imediatamente após o período padrão (30s). Requests em processamento são interrompidos,
+  conexões de banco são fechadas abruptamente, e transações podem ficar em estado inconsistente.
+impact: "Erros 5xx visíveis para o usuário durante rolling updates e scale-down do HPA."
+fix_hint: |
+  Configure terminationGracePeriodSeconds no spec do pod com valor maior que o tempo
+  máximo de processamento de uma requisição. Implemente handler de SIGTERM na aplicação
+  que para de aceitar novos requests e aguarda os em voo finalizarem.
+yaml_example: |
+  spec:
+    terminationGracePeriodSeconds: 60
+    containers:
+      - name: app
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5"]
+tags: [graceful-shutdown, sigterm, lifecycle, rolling-update, connections]
+related_rules: [RES-014]

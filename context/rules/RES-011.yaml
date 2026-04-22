@@ -1,0 +1,22 @@
+rule_id: RES-011
+title: "Pod Security Context não configurado"
+pillar: Resiliência
+severity: medium
+why: |
+  Sem securityContext no nível do pod, containers herdam permissões padrão permissivas
+  do container runtime. Volumes montados ficam com ownership root, forçando containers
+  a rodarem como root para acessar arquivos — criando dependência circular com RES-010.
+impact: "Containers dependem de root para acessar volumes, tornando RES-010 difícil de corrigir."
+fix_hint: |
+  Adicione spec.securityContext com fsGroup para resolver ownership de volumes,
+  runAsUser e runAsNonRoot a nível de pod como defaults para todos os containers.
+yaml_example: |
+  spec:
+    securityContext:
+      fsGroup: 1000
+      runAsUser: 1000
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+tags: [segurança, securitycontext, pod-level, fsgroup, permissões]
+related_rules: [RES-010, SEC-002, SEC-003]

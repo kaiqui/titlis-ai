@@ -1,0 +1,21 @@
+rule_id: RES-010
+title: "Container rodando como root"
+pillar: Resiliência
+severity: high
+why: |
+  Processo como UID 0 tem acesso irrestrito ao namespace de usuário do container.
+  Se comprometido via RCE, o atacante pode escalar para o host em clusters sem isolamento
+  forte (sem user namespaces ou seccomp), ler secrets de outros pods e modificar binários.
+impact: "Blast radius máximo em caso de comprometimento: acesso a sistema de arquivos do host."
+fix_hint: |
+  Configure securityContext.runAsNonRoot: true e runAsUser com UID acima de 1000.
+  Ajuste permissões de arquivos da imagem para o novo UID antes de fazer o build.
+yaml_example: |
+  containers:
+    - name: app
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+tags: [segurança, root, securitycontext, privilege, uid]
+related_rules: [RES-011, SEC-002, SEC-003, SEC-004]

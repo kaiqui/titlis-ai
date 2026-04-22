@@ -1,0 +1,24 @@
+rule_id: RES-018
+title: "Scale-down stabilization window muito curta"
+pillar: Resiliência
+severity: low
+why: |
+  Window de scale-down muito curta (ou zero) causa flapping: o HPA remove réplicas
+  rapidamente após um pico, e adiciona de volta quando a carga sobe novamente.
+  Esse ciclo constante gera overhead de scheduling, restarts desnecessários e
+  aumento de latência durante as transições.
+impact: "Flapping de réplicas em tráfego variável causa restarts frequentes e latência instável."
+fix_hint: |
+  Configure scaleDown.stabilizationWindowSeconds: 300 (5 minutos). Isso garante que
+  o HPA aguarde o suficiente para confirmar que a carga caiu antes de remover réplicas.
+yaml_example: |
+  spec:
+    behavior:
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Pods
+            value: 1
+            periodSeconds: 60
+tags: [hpa, scale-down, flapping, estabilização, resiliência]
+related_rules: [RES-007, RES-017, RES-019]

@@ -1,0 +1,25 @@
+rule_id: RES-017
+title: "Scale-up stabilization window indevida"
+pillar: Resiliência
+severity: low
+why: |
+  stabilizationWindowSeconds no scale-up faz o HPA aguardar antes de adicionar réplicas,
+  mesmo com CPU/memória já acima do target. Durante picos súbitos de tráfego, esse delay
+  causa filas, timeouts e degradação enquanto o sistema aguarda o período de estabilização.
+impact: "Latência elevada durante picos enquanto o HPA aguarda desnecessariamente para escalar."
+fix_hint: |
+  Configure scaleUp.stabilizationWindowSeconds: 0 para scale-up imediato. Reserve
+  a stabilization window apenas para o scale-down (evita flapping).
+yaml_example: |
+  spec:
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        policies:
+          - type: Pods
+            value: 4
+            periodSeconds: 60
+      scaleDown:
+        stabilizationWindowSeconds: 300
+tags: [hpa, scale-up, stabilization, latência, picos-de-tráfego]
+related_rules: [RES-007, RES-018, RES-019]

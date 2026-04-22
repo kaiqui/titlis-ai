@@ -1,0 +1,25 @@
+rule_id: RES-002
+title: "Readiness Probe não configurada"
+pillar: Resiliência
+severity: high
+why: |
+  Sem readinessProbe, o kube-proxy adiciona o pod ao pool assim que o container inicia,
+  antes da aplicação estar pronta. Requisições chegam antes do servidor estar ouvindo,
+  causando erros 502/503 durante deploys e restarts.
+impact: "Downtime visível durante rolling updates e reinícios de pods."
+fix_hint: |
+  Adicione readinessProbe que valide que a aplicação está pronta para receber tráfego.
+  O endpoint deve retornar 2xx apenas quando dependências (DB, cache) estão acessíveis.
+yaml_example: |
+  containers:
+    - name: app
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8080
+        initialDelaySeconds: 10
+        periodSeconds: 10
+        failureThreshold: 3
+        successThreshold: 1
+tags: [probes, health-check, resiliência, traffic, rolling-update]
+related_rules: [RES-001]

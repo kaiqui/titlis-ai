@@ -1,0 +1,22 @@
+rule_id: SEC-001
+title: "Imagem usando tag 'latest'"
+pillar: Segurança
+severity: high
+why: |
+  A tag 'latest' é mutável: uma nova versão da imagem publicada no registry muda o que
+  é executado no próximo restart do pod, sem nenhuma alteração no manifesto.
+  Isso torna deploys não-determinísticos e impossibilita rollback preciso.
+  Em cache frio, pods diferentes podem iniciar com versões distintas da mesma imagem.
+impact: "Deploys não-determinísticos: pods diferentes rodando versões diferentes da imagem."
+fix_hint: |
+  Use tags imutáveis: versão semântica (v1.2.3) ou SHA digest da imagem.
+  Em CI/CD, construa a tag a partir do commit SHA ou tag git. Nunca use 'latest' em produção.
+yaml_example: |
+  containers:
+    - name: app
+      # Use SHA digest para máxima imutabilidade
+      image: registry.example.com/app@sha256:abc123...
+      # Ou versão semântica
+      # image: registry.example.com/app:v2.1.0
+tags: [segurança, imagem, tag, imutabilidade, registry, ci-cd]
+related_rules: []

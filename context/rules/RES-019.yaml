@@ -1,0 +1,30 @@
+rule_id: RES-019
+title: "HPA sem behavior policies"
+pillar: Resiliência
+severity: low
+why: |
+  Sem behavior policies, o HPA usa defaults agressivos: pode adicionar ou remover
+  muitas réplicas de uma vez, causando thundering herd (muitos pods iniciando juntos)
+  ou queda brusca de capacidade. O comportamento padrão não respeita limites de taxa
+  de mudança adequados para workloads de produção.
+impact: "Scale-up agressivo causa sobrecarga de startup; scale-down abrupto pode causar filas."
+fix_hint: |
+  Adicione spec.behavior com policies que limitam quantos pods escalam por período,
+  tanto para cima quanto para baixo. Use scaleUp mais agressivo que scaleDown.
+yaml_example: |
+  spec:
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 60
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Pods
+            value: 1
+            periodSeconds: 60
+tags: [hpa, behavior-policies, scaling, taxa-de-mudança, thundering-herd]
+related_rules: [RES-007, RES-017, RES-018]

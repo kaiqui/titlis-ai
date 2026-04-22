@@ -1,0 +1,29 @@
+rule_id: PERF-003
+title: "HPA memory target não configurado"
+pillar: Performance
+severity: low
+why: |
+  Serviços com consumo de memória variável (caches, processamento de filas, ML inference)
+  podem saturar em memória sem nunca saturar em CPU. Sem métricas de memória no HPA,
+  picos de consumo RAM causam OOM Kill em vez de scale-out controlado.
+impact: "OOM Kill de pods sob carga de memória em vez de escalonamento automático."
+fix_hint: |
+  Para serviços com workload memory-bound, adicione métricas de memória ao HPA.
+  Use targetMemoryUtilizationPercentage: 70 como ponto de partida e ajuste com dados reais.
+yaml_example: |
+  spec:
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 60
+      - type: Resource
+        resource:
+          name: memory
+          target:
+            type: Utilization
+            averageUtilization: 70
+tags: [hpa, memória, performance, oom, scale-out, memory-bound]
+related_rules: [RES-007, RES-008, PERF-002]

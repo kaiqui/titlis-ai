@@ -1,0 +1,25 @@
+rule_id: RES-001
+title: "Liveness Probe não configurada"
+pillar: Resiliência
+severity: high
+why: |
+  Sem livenessProbe, o Kubernetes não detecta containers em deadlock. O pod permanece
+  com status "Running" e continua no pool de tráfego, mas não serve requisições.
+  O único recovery é uma intervenção manual ou reinício acidental do node.
+impact: "Pods travados acumulam no serviço causando degradação silenciosa e erros 5xx."
+fix_hint: |
+  Adicione livenessProbe ao container apontando para um endpoint /health ou um comando
+  de verificação. Use initialDelaySeconds maior que o tempo de startup da aplicação.
+yaml_example: |
+  containers:
+    - name: app
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        initialDelaySeconds: 30
+        periodSeconds: 15
+        failureThreshold: 3
+        timeoutSeconds: 5
+tags: [probes, health-check, resiliência, kubernetes-basics, deadlock]
+related_rules: [RES-002]

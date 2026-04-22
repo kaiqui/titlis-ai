@@ -1,0 +1,22 @@
+rule_id: PERF-001
+title: "Ratio CPU limit/request excessivo"
+pillar: Performance
+severity: medium
+why: |
+  Quando limits/requests > 4x, o CFS scheduler do Linux aplica CPU throttling de forma
+  agressiva. O pod recebe menos CPU que o necessário mesmo quando o nó tem capacidade
+  disponível, causando latência de cauda elevada (p99) que não aparece em métricas de CPU utilization.
+impact: "Latência de cauda alta (p99/p999) mesmo com CPU utilization aparentemente baixa."
+fix_hint: |
+  Mantenha ratio entre limits/requests de CPU entre 2x e 4x. Para serviços latency-sensitive,
+  use requests próximos dos limits (ratio 1x-2x) e prefira escalonamento horizontal ao vertical.
+yaml_example: |
+  containers:
+    - name: app
+      resources:
+        requests:
+          cpu: "250m"   # baseline consumo
+        limits:
+          cpu: "500m"   # 2x requests — ratio seguro
+tags: [performance, cpu, throttling, latência, cfs-scheduler, ratio]
+related_rules: [RES-003, RES-004]

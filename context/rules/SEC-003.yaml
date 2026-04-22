@@ -1,0 +1,23 @@
+rule_id: SEC-003
+title: "Privilege escalation permitido"
+pillar: Segurança
+severity: high
+why: |
+  allowPrivilegeEscalation: true (default) permite que um processo filho obtenha
+  mais permissões que o pai via setuid/setgid binários. Um processo comprometido pode
+  usar binários setuid existentes na imagem para elevar privilégios e escapar do container.
+impact: "Comprometimento de processo filho permite escalada para root dentro do container."
+fix_hint: |
+  Configure allowPrivilegeEscalation: false explicitamente. Combine com runAsNonRoot: true
+  e capabilities.drop: [ALL] para uma postura de segurança defense-in-depth.
+yaml_example: |
+  containers:
+    - name: app
+      securityContext:
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+        runAsUser: 1000
+        capabilities:
+          drop: ["ALL"]
+tags: [segurança, privilege-escalation, setuid, hardening, defense-in-depth]
+related_rules: [RES-010, SEC-004]

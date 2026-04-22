@@ -1,0 +1,22 @@
+rule_id: RES-006
+title: "Memory Limits não definido"
+pillar: Resiliência
+severity: high
+why: |
+  Sem memory limits, um pod com memory leak ou pico anormal pode consumir toda a RAM
+  disponível no nó. O kernel então aciona o OOM Killer, terminando processos no nó inteiro
+  — incluindo pods de outros serviços que estão funcionando corretamente.
+impact: "Falha em cascata no nó: OOM Kill de pods saudáveis de outros serviços."
+fix_hint: |
+  Defina resources.limits.memory igual ou até 2x o valor de requests.
+  Para memory limits, ratio de 2x é seguro — acima disso indica subutilização do requests.
+yaml_example: |
+  containers:
+    - name: app
+      resources:
+        requests:
+          memory: "256Mi"
+        limits:
+          memory: "512Mi"
+tags: [resources, memory, limits, oom, memory-leak]
+related_rules: [RES-005]

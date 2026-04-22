@@ -1,0 +1,22 @@
+rule_id: RES-003
+title: "CPU Requests não definido"
+pillar: Resiliência
+severity: high
+why: |
+  Sem cpu requests, o scheduler não tem base para calcular qual nó tem capacidade.
+  O pod recebe QoS class BestEffort — o primeiro a ser evicted sob pressão de recursos.
+  Em nodes sobrecarregados, o pod sofre throttling severo ou é terminado sem aviso.
+impact: "Pod evictado durante picos de carga, causando restart imprevisto e indisponibilidade."
+fix_hint: |
+  Defina resources.requests.cpu com o consumo médio da aplicação em idle (ex: 100m-250m).
+  Use Vertical Pod Autoscaler em modo recommendation para calibrar o valor correto.
+yaml_example: |
+  containers:
+    - name: app
+      resources:
+        requests:
+          cpu: "200m"
+        limits:
+          cpu: "500m"
+tags: [resources, scheduler, qos, besteffort, eviction]
+related_rules: [RES-004, RES-005, RES-006, PERF-001]
