@@ -1,5 +1,8 @@
+import asyncio
 import os
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator
 
 import litellm
@@ -17,6 +20,8 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+
 
 def _setup_litellm_callbacks() -> None:
     if not settings.langfuse_enabled:
@@ -29,9 +34,26 @@ def _setup_litellm_callbacks() -> None:
     logger.info("LiteLLM → Langfuse callback habilitado", extra={"host": settings.langfuse_base_url})
 
 
+async def _seed_rules_on_startup() -> None:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+    try:
+        from seed_rules import seed  # type: ignore[import-untyped]
+        await seed()
+    except SystemExit:
+        logger.warning("seed_rules: env vars ausentes ou diretório não encontrado — seed ignorado")
+    except Exception:
+        logger.exception("seed_rules: falhou na inicialização — serviço continua normalmente")
+    finally:
+        try:
+            sys.path.remove(str(_SCRIPTS_DIR))
+        except ValueError:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _setup_litellm_callbacks()
+    asyncio.create_task(_seed_rules_on_startup())
     logger.info(
         "titlis-ai iniciando",
         extra={

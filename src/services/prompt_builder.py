@@ -219,7 +219,8 @@ class PromptBuilder:
             "2. **Causa raiz** mais provável\n"
             "3. **Passos para correção** com exemplos de YAML quando aplicável\n"
             "4. **Boas práticas** relacionadas\n\n"
-            "Responda em português brasileiro."
+            "Responda em português brasileiro. "
+            "Esta é uma explicação completa e definitiva — não faça perguntas nem solicite informações adicionais ao usuário."
         )
 
         return [
