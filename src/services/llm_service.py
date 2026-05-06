@@ -67,6 +67,7 @@ class LLMService:
             model=model_id,
             messages=messages,
             api_key=config.api_key,
+            timeout=60,
             metadata=self._langfuse_metadata(tenant_id, model_id, trace_metadata),
         )
         content: str = response.choices[0].message.content or ""
@@ -95,6 +96,7 @@ class LLMService:
             messages=messages,
             api_key=config.api_key,
             stream=True,
+            timeout=60,
             metadata=self._langfuse_metadata(tenant_id, model_id, trace_metadata),
         )
         async for chunk in response:

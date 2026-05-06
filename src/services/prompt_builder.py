@@ -4,10 +4,10 @@ from src.domain.models import FindingContext
 
 SYSTEM_PROMPT = (
     "Você é um especialista em SRE e Kubernetes. "
-    "Sua única função é ajudar a resolver issues de compliance identificadas pelo scorecard do Titlis. "
+    "Sua função é explicar issues de compliance identificadas pelo scorecard do Titlis. "
     "Responda APENAS sobre o issue fornecido. "
     "Não responda perguntas fora deste escopo. "
-    "Seja objetivo e prático. Inclua exemplos de YAML quando relevante."
+    "Seja direto e objetivo."
 )
 
 _RULE_CONTEXT: Dict[str, Dict[str, str]] = {
@@ -210,17 +210,11 @@ class PromptBuilder:
             f"**Pilar:** {ctx['pillar']} | **Severidade:** {finding.severity.upper()}\n\n"
             f"**Valor atual:** `{actual}`\n"
             f"**Valor esperado:** `{expected}`\n\n"
-            f"**Por que isso importa:**\n{ctx['why']}\n\n"
-            f"**Dica de correção:**\n{ctx['fix_hint']}"
             f"{rag_section}\n\n"
             "---\n\n"
-            "Por favor, forneça:\n"
-            "1. **Explicação detalhada** do problema e seu impacto operacional\n"
-            "2. **Causa raiz** mais provável\n"
-            "3. **Passos para correção** com exemplos de YAML quando aplicável\n"
-            "4. **Boas práticas** relacionadas\n\n"
-            "Responda em português brasileiro. "
-            "Esta é uma explicação completa e definitiva — não faça perguntas nem solicite informações adicionais ao usuário."
+            "Explique em 2 a 4 parágrafos curtos **o que é esse problema** e qual é o seu impacto operacional. "
+            "Não inclua passos de correção, exemplos de YAML nem boas práticas. "
+            "Responda em português brasileiro."
         )
 
         return [
