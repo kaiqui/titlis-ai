@@ -44,6 +44,10 @@ class ConfirmRemediationRequest(BaseModel):
     approved: bool
 
 
+class SetManifestPathRequest(BaseModel):
+    manifest_path: str
+
+
 class PullRequestResult(BaseModel):
     number: int
     title: str

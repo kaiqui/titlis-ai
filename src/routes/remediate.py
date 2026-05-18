@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 
 from src.bootstrap.dependencies import get_remediation_graph
-from src.domain.models import ConfirmRemediationRequest, RemediateRequest
+from src.domain.models import ConfirmRemediationRequest, RemediateRequest, SetManifestPathRequest
 from src.observability.langfuse_handler import get_langfuse_callbacks
 from src.observability.metrics import (
     ai_latency_seconds,
@@ -74,17 +74,29 @@ async def remediate(body: RemediateRequest, request: Request) -> StreamingRespon
             async for event in graph.compiled.astream(initial_state, config, stream_mode="updates"):
                 if "__interrupt__" in event:
                     interrupt_val = event["__interrupt__"][0].value
-                    yield _sse(
-                        {
-                            "type": "fix_ready",
-                            "thread_id": thread_id,
-                            "patched_manifest": interrupt_val.get("patched_manifest"),
-                            "current_manifest": interrupt_val.get("current_manifest"),
-                            "findings": interrupt_val.get("findings", []),
-                            "deployment_name": interrupt_val.get("deployment_name"),
-                            "namespace": interrupt_val.get("namespace"),
-                        }
-                    )
+                    if interrupt_val.get("type") == "manifest_path_required":
+                        yield _sse(
+                            {
+                                "type": "path_required",
+                                "thread_id": thread_id,
+                                "detected_environment": interrupt_val.get("detected_environment"),
+                                "suggested_path": interrupt_val.get("suggested_path"),
+                                "deployment_name": interrupt_val.get("deployment_name"),
+                                "namespace": interrupt_val.get("namespace"),
+                            }
+                        )
+                    else:
+                        yield _sse(
+                            {
+                                "type": "fix_ready",
+                                "thread_id": thread_id,
+                                "patched_manifest": interrupt_val.get("patched_manifest"),
+                                "current_manifest": interrupt_val.get("current_manifest"),
+                                "findings": interrupt_val.get("findings", []),
+                                "deployment_name": interrupt_val.get("deployment_name"),
+                                "namespace": interrupt_val.get("namespace"),
+                            }
+                        )
                     yield _sse({"type": "done"})
                     return
 
@@ -180,6 +192,65 @@ async def confirm_remediation(
 
         except Exception as exc:
             logger.exception("Erro ao confirmar remediação", extra={"thread_id": thread_id})
+            yield _sse({"type": "error", "error": str(exc)})
+            yield _sse({"type": "done"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/remediate/{thread_id}/set-path")
+async def set_manifest_path(
+    thread_id: str,
+    body: SetManifestPathRequest,
+    request: Request,
+) -> StreamingResponse:
+    _verify_internal_secret(request)
+
+    graph = get_remediation_graph()
+    config: dict = {"configurable": {"thread_id": thread_id}}
+
+    async def generate() -> AsyncGenerator[str, None]:
+        try:
+            async for event in graph.compiled.astream(
+                Command(resume=body.manifest_path), config, stream_mode="updates"
+            ):
+                if "__interrupt__" in event:
+                    interrupt_val = event["__interrupt__"][0].value
+                    yield _sse(
+                        {
+                            "type": "fix_ready",
+                            "thread_id": thread_id,
+                            "patched_manifest": interrupt_val.get("patched_manifest"),
+                            "current_manifest": interrupt_val.get("current_manifest"),
+                            "findings": interrupt_val.get("findings", []),
+                            "deployment_name": interrupt_val.get("deployment_name"),
+                            "namespace": interrupt_val.get("namespace"),
+                        }
+                    )
+                    yield _sse({"type": "done"})
+                    return
+
+                for node_name, node_output in event.items():
+                    if node_name.startswith("__"):
+                        continue
+                    if node_name == "check_existing_pr":
+                        existing = (node_output or {}).get("existing_pr")
+                        if existing:
+                            yield _sse({"type": "existing_pr", "pr_url": existing["pr_url"]})
+                    yield _sse({"type": "progress", "node": node_name})
+
+            final = graph.compiled.get_state(config)
+            state_vals = final.values if final else {}
+            if state_vals.get("validation_errors") and state_vals.get("retry_count", 0) >= _MAX_RETRIES:
+                yield _sse({"type": "error", "error": "patch_validation_failed_max_retries"})
+            yield _sse({"type": "done"})
+
+        except Exception as exc:
+            logger.exception("Erro ao definir path do manifest", extra={"thread_id": thread_id})
             yield _sse({"type": "error", "error": str(exc)})
             yield _sse({"type": "done"})
 

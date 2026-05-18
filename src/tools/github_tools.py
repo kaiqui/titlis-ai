@@ -3,9 +3,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from src.domain.models import RemediationFile
 from src.infrastructure.github.client import GitHubAPIClient
 from src.infrastructure.github.repository import GitHubRepository
+from src.infrastructure.prbot_client import PrbotClient
 from src.infrastructure.titlis_api.scorecard_client import ScorecardClient
 from src.tools.base import ToolDefinition, ToolRegistry
 from src.utils.logger import get_logger
@@ -133,59 +133,27 @@ def build_github_tools(
         if violation:
             raise ValueError(violation)
 
-        owner, name = _parse_repo(repo_url)
-        import datetime
-
-        ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
-        branch_name = f"fix/auto-remediation-{namespace}-{deployment_name}-{ts}"
-
-        exists = await repo.branch_exists(owner, name, branch_name)
-        if not exists:
-            await repo.create_branch(owner, name, branch_name, base_branch)
-
-        findings_str = "\n".join(f"- {f}" for f in findings)
-        commit_msg = f"fix(titlis-ai): auto-remediation for {deployment_name} [{', '.join(findings)}]"
-        files = [RemediationFile(path=path, content=patched_yaml, commit_message=commit_msg)]
-        await repo.commit_files(owner, name, branch_name, files)
-
-        pr_body = (
-            f"## Remediação automática — {deployment_name}\n\n"
-            f"**Namespace:** {namespace}\n\n"
-            f"**Findings corrigidos:**\n{findings_str}\n\n"
-            f"*Gerado pelo Titlis AI Assistant*"
-        )
-        pr = await repo.create_pull_request(
-            repo_owner=owner,
-            repo_name=name,
-            branch_name=branch_name,
-            base_branch=base_branch,
-            title=f"fix(titlis): auto-remediation {deployment_name} [{', '.join(findings[:3])}]",
-            body=pr_body,
-        )
-
-        if scorecard_client:
-            resolved_wid = workload_id
-            if not resolved_wid:
-                try:
-                    sc = await scorecard_client.get_scorecard_by_name(tenant_id, deployment_name, namespace)
-                    resolved_wid = (sc or {}).get("workload_id")
-                except Exception:
-                    pass
-            if resolved_wid:
-                try:
-                    await scorecard_client.notify_remediation_started(
-                        tenant_id=tenant_id,
-                        workload_id=resolved_wid,
-                        pr_url=pr.url,
-                        pr_number=pr.number,
-                        github_branch=pr.branch,
-                        repo_url=repo_url,
-                        finding_ids=findings,
-                    )
-                except Exception:
-                    logger.exception("Falha ao notificar remediação", extra={"workload_id": resolved_wid})
-
-        return {"pr_url": pr.url, "pr_number": pr.number, "branch": pr.branch}
+        payload = {
+            "title": f"fix(titlis): auto-remediation {deployment_name} [{', '.join(findings[:3])}]",
+            "description": (
+                f"Remediação automática — {deployment_name}\n"
+                f"Namespace: {namespace}\n"
+                f"Findings corrigidos: {', '.join(findings)}"
+            ),
+            "workload_uids": [workload_id] if workload_id else [],
+            "rule_id": findings[0] if findings else "",
+            "cascade_up_to": "dev",
+            "tenant_id": tenant_id,
+            "trigger_source": "agent",
+            "repo_url": repo_url,
+            "path": path,
+            "patched_yaml": patched_yaml,
+            "namespace": namespace,
+            "deployment_name": deployment_name,
+            "findings": findings,
+        }
+        result = await PrbotClient().create_campaign(payload)
+        return {"campaign_id": result.get("id"), "status": result.get("status")}
 
     registry.register(
         ToolDefinition(

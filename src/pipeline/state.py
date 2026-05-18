@@ -30,6 +30,9 @@ class ScorecardRemediationState(TypedDict, total=False):
     validation_errors: List[str]
     retry_count: int
 
+    # ── populated by resolve_manifest_path ───────────────────────────────────
+    detected_environment: Optional[str]
+
     # ── human-in-the-loop ────────────────────────────────────────────────────
     approved: Optional[bool]
 

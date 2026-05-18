@@ -8,6 +8,7 @@ from src.domain.models import AgentToolDecision, TenantAiConfig, ToolProposal
 from src.infrastructure.titlis_api.scorecard_client import ScorecardClient
 from src.pipeline.session import AgentSession, SessionStore
 from src.services.mcp_adapter import McpAdapter
+from src.tools.campaign_tools import build_campaign_tools
 from src.tools.github_tools import build_github_tools
 from src.tools.read_tools import build_read_tools
 from src.tools.slo_tools import build_slo_tools
@@ -15,7 +16,7 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_WRITE_TOOLS = {"create_remediation_pr", "update_slo_thresholds"}
+_WRITE_TOOLS = {"create_remediation_pr", "update_slo_thresholds", "trigger_bulk_pr_campaign"}
 
 _SYSTEM_PROMPT = """Você é ARIA (Assistente de Remediação Inteligente Autônoma), especialista em operações SRE Kubernetes na plataforma Titlis.
 
@@ -52,6 +53,8 @@ class AgentService:
         if github_token:
             base_branch = ai_cfg.get("github_base_branch", "main")
             registries.append(build_github_tools(github_token, base_branch, tenant_id, self._scorecard))
+            actor_email = ai_cfg.get("actor_email")
+            registries.append(build_campaign_tools(tenant_id=tenant_id, actor_email=actor_email))
         return McpAdapter(*registries)
 
     def _ai_config(self, session: AgentSession) -> TenantAiConfig:
@@ -311,6 +314,7 @@ _TOOL_DESC: Dict[str, str] = {
     "get_slo_status": "Verificar status de SLO",
     "list_auto_created_slos": "Listar SLOs criados automaticamente",
     "update_slo_thresholds": "Atualizar thresholds de SLO",
+    "trigger_bulk_pr_campaign": "Disparar campanha de PRs em lote para múltiplos workloads",
 }
 
 

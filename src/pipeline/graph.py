@@ -23,6 +23,20 @@ logger = get_logger(__name__)
 _MAX_RETRIES = 3
 
 
+def _detect_env_from_cluster(cluster_name: str) -> str:
+    name = cluster_name.lower()
+    for kw in ("prod", "production"):
+        if kw in name:
+            return "prod"
+    for kw in ("hml", "homolog", "staging", "stg"):
+        if kw in name:
+            return "hml"
+    for kw in ("dev", "development"):
+        if kw in name:
+            return "dev"
+    return ""
+
+
 class RemediationGraph:
     def __init__(
         self,
@@ -60,6 +74,33 @@ class RemediationGraph:
             "namespace": scorecard.get("namespace", ""),
             "deployment_name": scorecard.get("workload", state["workload_id"]),
             "live_deployment": scorecard,
+        }
+
+    async def _resolve_manifest_path(self, state: ScorecardRemediationState) -> Dict[str, Any]:
+        live = state.get("live_deployment") or {}
+        labels = live.get("labels") or {}
+
+        env = (
+            labels.get("env")
+            or labels.get("environment")
+            or live.get("environment")
+            or _detect_env_from_cluster(live.get("cluster", ""))
+            or "unknown"
+        )
+
+        confirmed_path = interrupt(
+            {
+                "type": "manifest_path_required",
+                "detected_environment": env,
+                "suggested_path": state.get("deploy_manifest_path", ""),
+                "deployment_name": state.get("deployment_name", ""),
+                "namespace": state.get("namespace", ""),
+            }
+        )
+
+        return {
+            "deploy_manifest_path": str(confirmed_path),
+            "detected_environment": env,
         }
 
     async def _fetch_context(self, state: ScorecardRemediationState) -> Dict[str, Any]:
@@ -367,6 +408,7 @@ class RemediationGraph:
         builder = StateGraph(ScorecardRemediationState)
 
         builder.add_node("classify_findings", self._classify_findings)
+        builder.add_node("resolve_manifest_path", self._resolve_manifest_path)
         builder.add_node("fetch_context", self._fetch_context)
         builder.add_node("check_existing_pr", self._check_existing_pr)
         builder.add_node("analyze_findings", self._analyze_findings)
@@ -377,7 +419,8 @@ class RemediationGraph:
         builder.add_node("notify_api", self._notify_api)
 
         builder.add_edge(START, "classify_findings")
-        builder.add_edge("classify_findings", "fetch_context")
+        builder.add_edge("classify_findings", "resolve_manifest_path")
+        builder.add_edge("resolve_manifest_path", "fetch_context")
         builder.add_edge("fetch_context", "check_existing_pr")
         builder.add_conditional_edges("check_existing_pr", self._route_after_check_pr)
         builder.add_edge("analyze_findings", "generate_yaml_patch")
