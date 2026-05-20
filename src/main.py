@@ -14,6 +14,7 @@ from src.routes.feedback import router as feedback_router
 from src.routes.health import router as health_router
 from src.routes.knowledge import router as knowledge_router
 from src.routes.metrics import router as metrics_router
+from src.routes.prbot import router as prbot_router
 from src.routes.remediate import router as remediate_router
 from src.settings import settings
 from src.utils.logger import get_logger
@@ -80,3 +81,4 @@ app.include_router(remediate_router, prefix="/v1")
 app.include_router(agent_router, prefix="/v1")
 app.include_router(knowledge_router, prefix="/v1")
 app.include_router(feedback_router, prefix="/v1")
+app.include_router(prbot_router, prefix="/v1")
