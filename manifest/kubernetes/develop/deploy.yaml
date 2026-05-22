@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: titlis-ai-secrets
+  namespace: __NAMESPACE__
+type: Opaque
+stringData:
+  TITLIS_AI_INTERNAL_SECRET: "__TITLIS_AI_INTERNAL_SECRET__"
+  LANGFUSE_PUBLIC_KEY: "__LANGFUSE_PUBLIC_KEY__"
+  LANGFUSE_SECRET_KEY: "__LANGFUSE_SECRET_KEY__"
+  GENAI_API_KEY: "__GENAI_API_KEY__"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: titlis-ai-config
+  namespace: __NAMESPACE__
+data:
+  PORT: "8001"
+  HOST: "0.0.0.0"
+  LOG_LEVEL: "INFO"
+  TITLIS_API_URL: "http://titlis-api:8080"
+  TITLIS_API_UDP_HOST: "titlis-api"
+  TITLIS_API_UDP_PORT: "8125"
+  RAG_ENABLED: "true"
+  RAG_TOP_K: "3"
+  LANGFUSE_ENABLED: "__LANGFUSE_ENABLED__"
+  LANGFUSE_BASE_URL: "__LANGFUSE_BASE_URL__"
+  DD_ENV: "preprod"
+  DD_SERVICE: "titlis-ai"
+  DD_VERSION: "__IMAGE_TAG__"
+  DD_TRACE_ENABLED: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: titlis-ai
+  namespace: __NAMESPACE__
+  labels:
+    app: titlis-ai
+    tags.datadoghq.com/env: "preprod"
+    tags.datadoghq.com/service: "titlis-ai"
+    tags.datadoghq.com/version: "__IMAGE_TAG__"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: titlis-ai
+  template:
+    metadata:
+      labels:
+        app: titlis-ai
+        tags.datadoghq.com/env: "preprod"
+        tags.datadoghq.com/service: "titlis-ai"
+        tags.datadoghq.com/version: "__IMAGE_TAG__"
+        admission.datadoghq.com/enabled: "true"
+      annotations:
+        admission.datadoghq.com/python-lib.version: "latest"
+    spec:
+      containers:
+        - name: titlis-ai
+          image: __DOCKERHUB_USER__/titlis-ai:__IMAGE_TAG__
+          imagePullPolicy: __IMAGE_PULL_POLICY__
+          ports:
+            - containerPort: 8001
+              name: http
+          envFrom:
+            - configMapRef:
+                name: titlis-ai-config
+            - secretRef:
+                name: titlis-ai-secrets
+          env:
+            - name: DD_AGENT_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: titlis-ai
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app: titlis-ai
+  ports:
+    - port: 8001
+      targetPort: http
+      protocol: TCP
+      name: http
