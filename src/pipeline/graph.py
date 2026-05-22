@@ -10,7 +10,6 @@ from src.infrastructure.github.client import GitHubAPIClient
 from src.infrastructure.github.repository import GitHubRepository
 from src.infrastructure.titlis_api.scorecard_client import ScorecardClient
 from src.infrastructure.titlis_api.knowledge_client import KnowledgeClient
-from src.infrastructure.udp_client import UdpEventClient
 from src.domain.models import RemediationFile
 from src.pipeline.state import ScorecardRemediationState
 from src.services.embedding_service import EmbeddingService
@@ -44,13 +43,11 @@ class RemediationGraph:
         scorecard_client: ScorecardClient,
         knowledge_client: KnowledgeClient,
         embedding_service: EmbeddingService,
-        udp_client: UdpEventClient,
     ) -> None:
         self._llm = llm_service
         self._scorecard = scorecard_client
         self._knowledge = knowledge_client
         self._embedding = embedding_service
-        self._udp = udp_client
         self._graph = self._build()
 
     # ── nodes ─────────────────────────────────────────────────────────────────

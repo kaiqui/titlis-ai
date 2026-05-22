@@ -20,8 +20,6 @@ data:
   HOST: "0.0.0.0"
   LOG_LEVEL: "INFO"
   TITLIS_API_URL: "http://titlis-api:8080"
-  TITLIS_API_UDP_HOST: "titlis-api"
-  TITLIS_API_UDP_PORT: "8125"
   RAG_ENABLED: "true"
   RAG_TOP_K: "3"
   LANGFUSE_ENABLED: "__LANGFUSE_ENABLED__"

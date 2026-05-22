@@ -2,7 +2,6 @@ from functools import lru_cache
 
 from src.infrastructure.titlis_api.knowledge_client import KnowledgeClient
 from src.infrastructure.titlis_api.scorecard_client import ScorecardClient
-from src.infrastructure.udp_client import UdpEventClient
 from src.pipeline.graph import RemediationGraph
 from src.pipeline.session import SessionStore
 from src.services.agent_service import AgentService
@@ -46,18 +45,12 @@ def get_scorecard_client() -> ScorecardClient:
 
 
 @lru_cache()
-def get_udp_client() -> UdpEventClient:
-    return UdpEventClient()
-
-
-@lru_cache()
 def get_remediation_graph() -> RemediationGraph:
     return RemediationGraph(
         llm_service=get_llm_service(),
         scorecard_client=get_scorecard_client(),
         knowledge_client=get_knowledge_client(),
         embedding_service=get_embedding_service(),
-        udp_client=get_udp_client(),
     )
 
 
