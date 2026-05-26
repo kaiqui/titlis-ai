@@ -11,13 +11,15 @@
 tem `kubeconfig` — o operator é o único ator K8s. O titlis-ai é agnóstico de provider:
 cada tenant configura sua própria API key e modelo via `TenantAiConfig`.
 
-**Responsabilidades que migraram do `titlis-operator`:**
-- Ler `deploy.yaml` do GitHub
-- Gerar patch de resources/HPA
-- Abrir PR no GitHub (com validação never-reduce)
-- Controle humano antes do PR (human-in-the-loop)
+**Responsabilidades principais:**
+- Agente conversacional human-in-the-loop com tools de leitura (scorecard, RAG, SLO) e escrita via **MCP GitHub real** (aprovação explícita por tool call)
+- Remediação LangGraph unitária: lê manifest → analisa → gera patch → aguarda confirmação humana → cria PR via MCP GitHub
+- Análise forense de incidentes via **MCP Datadog real** (acionado por titlis-incident)
+- Base de conhecimento RAG (embeddings via titlis-api/pgvector)
+- Explicação de findings por SSE streaming
 
-O operator após a migração: avalia → escreve CRD → envia UDP. Sem GitHub.
+O titlis-ai **não gerencia campanhas em frota** — essa responsabilidade foi arquivada
+junto com o titlis-prbot. Todo PR GitHub é unitário e requer aprovação humana explícita.
 
 ---
 
@@ -29,11 +31,16 @@ O operator após a migração: avalia → escreve CRD → envia UDP. Sem GitHub.
 | Framework HTTP | FastAPI | — |
 | LLM abstraction | LiteLLM | — |
 | Grafo de agente | LangGraph | 0.3.5 |
+| **MCP client** | **mcp** | **≥1.9** |
 | Embeddings | pgvector (via titlis-api) | — |
 | HTTP client | httpx (async) | — |
 | Validação | Pydantic v2 | — |
 | Testes | pytest + pytest-asyncio | — |
 | Lint | flake8 + black + mypy | — |
+
+**Binário externo:** `github-mcp-server` (v1.0.5) — instalado em `/usr/local/bin/` pelo
+Dockerfile. Executado como subprocesso stdio pelo `github_mcp_session()`. O binário é
+obrigatório em produção; em testes, mockado via `AsyncMock`.
 
 ---
 
@@ -45,39 +52,42 @@ titlis-ai/
 │   ├── main.py                          # FastAPI app + lifespan
 │   ├── settings.py                      # Pydantic Settings (env vars)
 │   ├── domain/
-│   │   └── models.py                    # ExplainRequest, RemediateRequest, ConfirmRemediationRequest, TenantAiConfig
+│   │   └── models.py                    # ExplainRequest, RemediateRequest, TenantAiConfig, ToolProposal, ...
 │   ├── routes/
 │   │   ├── agent.py                     # POST /v1/agent/chat + tools/respond + GET audit (SSE)
 │   │   ├── explain.py                   # POST /v1/explain (SSE streaming)
 │   │   ├── remediate.py                 # POST /v1/remediate + POST /v1/remediate/{thread_id}/confirm
 │   │   ├── knowledge.py                 # POST /v1/knowledge/seed + POST /v1/knowledge/search
+│   │   ├── incident.py                  # POST /v1/internal/incident/analyze (SSE — chamado pelo titlis-incident)
 │   │   └── health.py                    # GET /health
 │   ├── services/
-│   │   ├── agent_service.py             # AgentService — loop LLM + human-in-the-loop tool approval
+│   │   ├── agent_service.py             # AgentService — loop LLM + human-in-the-loop + _ToolRunner + MCP sessions
 │   │   ├── llm_service.py               # LiteLLM wrapper (chat, stream)
 │   │   ├── prompt_builder.py            # Monta prompts por rule_id
 │   │   ├── embedding_service.py         # Gera embeddings via LiteLLM
 │   │   ├── knowledge_seeder.py          # Semeia base de conhecimento
-│   │   └── mcp_adapter.py               # Converte ToolRegistry → function calling
+│   │   └── mcp_adapter.py               # Converte ToolRegistry → function calling (tools customizadas)
 │   ├── tools/
 │   │   ├── base.py                      # ToolDefinition + ToolRegistry
 │   │   ├── read_tools.py                # 6 tools de leitura (scorecard, RAG, history)
-│   │   ├── github_tools.py              # 3 tools GitHub (read/check/create PR)
+│   │   ├── github_tools.py              # Apenas utilitários never-reduce usados pelo graph.py
 │   │   └── slo_tools.py                 # 3 tools SLO (get/list/update)
 │   ├── pipeline/
 │   │   ├── session.py                   # AgentSession dataclass + SessionStore (TTL 3600s)
 │   │   ├── state.py                     # ScorecardRemediationState TypedDict
-│   │   └── graph.py                     # RemediationGraph (LangGraph StateGraph)
+│   │   └── graph.py                     # RemediationGraph (LangGraph StateGraph) — usa github_tools utils
 │   ├── infrastructure/
-│   │   ├── github/
-│   │   │   ├── client.py                # httpx async — GitHub REST API
-│   │   │   └── repository.py            # branch, commit, PR, find_existing_pr
+│   │   ├── mcp/
+│   │   │   ├── github_mcp.py            # github_mcp_session() — stdio subprocess (github-mcp-server)
+│   │   │   └── datadog_mcp.py           # datadog_mcp_session() — HTTP/SSE (coterm.{site}/mcp)
 │   │   ├── titlis_api/
 │   │   │   ├── scorecard_client.py      # 7 métodos — endpoints /v1/internal/ai/*
-│   │   │   └── knowledge_client.py      # store/search chunks RAG
+│   │   │   ├── knowledge_client.py      # store/search chunks RAG
+│   │   │   └── datadog_config_client.py # get_dd_config(tenant_id) → credenciais DD da titlis-api
 │   │   └── udp_client.py                # UdpEventClient — envia remediation_started
 │   └── bootstrap/
-│       └── dependencies.py              # Singletons: llm, scorecard, knowledge, embedding, udp, graph, session_store, agent_service
+│       └── dependencies.py              # Singletons: llm, scorecard, knowledge, embedding, udp, graph,
+│                                        #   session_store, agent_service, datadog_config_client
 ├── tests/
 │   ├── unit/
 │   │   ├── test_llm_service.py
@@ -92,7 +102,8 @@ titlis-ai/
 
 ## 4. Auth Interna
 
-Todos os endpoints (`/v1/agent/*`, `/v1/remediate`, `/v1/explain`, `/v1/knowledge/*`) exigem o header:
+Todos os endpoints (`/v1/agent/*`, `/v1/remediate`, `/v1/explain`, `/v1/knowledge/*`,
+`/v1/internal/incident/*`) exigem o header:
 ```
 X-Internal-Secret: <settings.internal_secret>
 ```
@@ -103,7 +114,7 @@ para o titlis-ai — o titlis-ai não valida JWTs diretamente.
 
 ---
 
-## 5. Fase 1 — LLM Service e Explain Route
+## 5. LLM Service e Explain Route
 
 ### LLMService (`src/services/llm_service.py`)
 
@@ -128,7 +139,7 @@ Templates por `rule_id` com system prompt universal SRE:
 
 ---
 
-## 6. Fase 2 — RAG e Base de Conhecimento
+## 6. RAG e Base de Conhecimento
 
 ### EmbeddingService (`src/services/embedding_service.py`)
 
@@ -159,7 +170,7 @@ Os vetores ficam no pgvector do PostgreSQL gerenciado pelo titlis-api.
 
 ---
 
-## 7. Fase 3 — MCP Tools
+## 7. Tools Customizadas (McpAdapter)
 
 ### ToolDefinition e ToolRegistry (`src/tools/base.py`)
 
@@ -201,20 +212,6 @@ class ToolRegistry:
 - `get_namespace_inventory(namespace)` — lista deployments do namespace
 - `get_remediation_history(workload_id)` — PRs anteriores do workload
 
-### Tools GitHub (`src/tools/github_tools.py`)
-
-`build_github_tools(github_token, base_branch, tenant_id)` → `ToolRegistry` com 3 tools:
-- `read_deploy_manifest(repo_url, branch, path)` — lê arquivo via GitHub API
-- `check_existing_pr(repo_url, namespace, deployment)` — verifica PR aberto (idempotência)
-- `create_remediation_pr(repo_url, path, patched_yaml, current_yaml, findings, ...)` — cria branch + commit + PR; valida never-reduce antes de qualquer escrita
-
-**Validação never-reduce** (em `github_tools.py`):
-```python
-def _never_reduce_violated(current: str, suggested: str) -> bool:
-    # Parseia cpu (millicores) e memory (MiB)
-    # Retorna True se sugerido < atual (violação)
-```
-
 ### Tools SLO (`src/tools/slo_tools.py`)
 
 `build_slo_tools(scorecard_client, tenant_id)` → `ToolRegistry` com 3 tools:
@@ -228,7 +225,7 @@ a `SloValidationError` herda de `ValueError` e pode ser silenciada acidentalment
 
 ### McpAdapter (`src/services/mcp_adapter.py`)
 
-Converte `ToolRegistry` → function calling de qualquer provider via LiteLLM:
+Converte `ToolRegistry` (tools customizadas) → function calling de qualquer provider via LiteLLM:
 ```python
 class McpAdapter:
     def to_openai_tools(self) -> List[Dict[str, Any]]: ...    # type="function"
@@ -236,161 +233,66 @@ class McpAdapter:
     async def execute(self, tool_name: str, args: Dict[str, Any]) -> Any: ...
 ```
 
+**Importante:** `McpAdapter` cobre apenas as tools customizadas (leitura, SLO). As tools
+de GitHub e Datadog são roteadas diretamente via as sessões MCP reais pelo `_ToolRunner`.
+
 ---
 
-## 8. Fase 4 — LangGraph Pipeline
+## 8. MCP GitHub e Datadog (Servidores Reais)
 
-### Estado (`src/pipeline/state.py`)
+### github_mcp_session (`src/infrastructure/mcp/github_mcp.py`)
+
+Abre uma sessão MCP com o `github-mcp-server` via **stdio subprocess**:
 
 ```python
-class ScorecardRemediationState(TypedDict, total=False):
-    tenant_id: int
-    workload_id: str          # k8s_uid
-    finding_ids: List[str]
-    repo_url: str
-    deploy_manifest_path: str
-    ai_config: Dict[str, Any]
-    findings: List[Dict[str, Any]]
-    namespace: str
-    deployment_name: str
-    rag_context: List[Dict[str, Any]]
-    current_manifest: Optional[str]
-    live_deployment: Optional[Dict[str, Any]]
-    existing_pr: Optional[Dict[str, Any]]
-    analysis: Optional[str]
-    patched_manifest: Optional[str]
-    validation_errors: List[str]
-    retry_count: int
-    approved: Optional[bool]
-    pr_result: Optional[Dict[str, Any]]
+@asynccontextmanager
+async def github_mcp_session(github_token: str) -> AsyncIterator[ClientSession]:
+    env = {**os.environ, "GITHUB_TOKEN": github_token}
+    server_params = StdioServerParameters(command="github-mcp-server", args=["stdio"], env=env)
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            yield session
 ```
 
-### RemediationGraph (`src/pipeline/graph.py`)
+- O binário `github-mcp-server` é instalado pelo Dockerfile em `/usr/local/bin/`
+- O token GitHub vem do `TenantAiConfig.github_token` (descriptografado em memória pela titlis-api antes do proxy) — nunca de variável de ambiente global
+- A sessão dura o tempo do turn; é gerenciada pelo `AsyncExitStack` no `AgentService`
 
-Singleton, compilado com `MemorySaver()` checkpointer. Serviços injetados no construtor:
-`llm_service`, `scorecard_client`, `knowledge_client`, `embedding_service`, `udp_client`.
+### datadog_mcp_session (`src/infrastructure/mcp/datadog_mcp.py`)
 
-**9 nós:**
-
-| Nó | O que faz |
-|---|---|
-| `classify_findings` | Busca scorecard por k8s_uid; filtra findings pelos `finding_ids` solicitados; seta `namespace`, `deployment_name` |
-| `fetch_context` | Paralelo via `asyncio.gather`: RAG (embedding + search) + leitura do manifest do GitHub |
-| `check_existing_pr` | Usa `GitHubRepository.find_open_remediation_pr()`; seta `existing_pr` |
-| `analyze_findings` | LLM `chat()` com findings + manifest + contexto RAG |
-| `generate_yaml_patch` | LLM gera YAML patchado; strip de markdown fences; incrementa `retry_count`; limpa `validation_errors` |
-| `validate_patch` | `yaml.safe_load()` + verificação never-reduce linha a linha |
-| `await_user_confirmation` | `interrupt({patched_manifest, current_manifest, findings, ...})`; pausa o grafo |
-| `create_remediation_pr` | Cria branch → commit → PR via `GitHubRepository` |
-| `notify_api` | Envia UDP `remediation_started` para titlis-api:8125 |
-
-**Topologia:**
-```
-START → classify_findings → fetch_context → check_existing_pr
-check_existing_pr --condicional--> analyze_findings | END (PR já existe)
-analyze_findings → generate_yaml_patch → validate_patch
-validate_patch --condicional--> generate_yaml_patch (retry, max 3) | END (esgotou) | await_user_confirmation
-await_user_confirmation --condicional--> create_remediation_pr | END (rejeitado)
-create_remediation_pr → notify_api → END
-```
-
-**3 métodos de roteamento (estáticos):**
-- `_route_after_check_pr(state)` → `END` se `existing_pr`, senão `"analyze_findings"`
-- `_route_after_validate(state)` → `"generate_yaml_patch"` se erros e retry < 3; `END` se retry ≥ 3; `"await_user_confirmation"` se sem erros
-- `_route_after_confirmation(state)` → `"create_remediation_pr"` se `approved`, senão `END`
-
-### UdpEventClient (`src/infrastructure/udp_client.py`)
-
-Envelope UDP padrão: `{v:1, t:event_type, ts:..., tenant_id:..., data:...}`.
-Envia via `socket.SOCK_DGRAM` usando `run_in_executor` (não bloqueia event loop).
-Host padrão: `titlis-api`, porta: 8125.
-
-### Endpoints SSE (`src/routes/remediate.py`)
-
-**`POST /v1/remediate`** — inicia o pipeline:
-- Gera `thread_id` (UUID)
-- Monta `initial_state` com dados do body + `retry_count=0`
-- Roda `graph.compiled.astream(initial_state, config, stream_mode="updates")`
-- Detecta `__interrupt__` → emite evento SSE `fix_ready` com `thread_id`
-- Ao final → emite `done`
-
-**`POST /v1/remediate/{thread_id}/confirm`** — retoma grafo pausado:
-- Roda `graph.compiled.astream(Command(resume=body.approved), config, stream_mode="updates")`
-- Detecta nó `create_remediation_pr` → emite `pr_created`
-- Ao final → emite `done`
-
-**Tipos de eventos SSE:**
-
-| Tipo | Quando |
-|---|---|
-| `fix_ready` | Grafo pausa para confirmação humana (inclui `thread_id`, `patched_manifest`, `current_manifest`, `findings`) |
-| `existing_pr` | PR já existe — retorna `pr_url` e encerra |
-| `progress` | A cada nó concluído (inclui `node` name) |
-| `pr_created` | PR criado com sucesso (inclui `pr_url`, `pr_number`, `branch`) |
-| `error` | Exceção não tratada no pipeline |
-| `done` | Sempre o último evento do stream |
-
----
-
-## 9. Dependências Singleton (`src/bootstrap/dependencies.py`)
+Abre uma sessão MCP com o servidor Datadog oficial via **HTTP/SSE**:
 
 ```python
-@lru_cache() get_llm_service() → LLMService
-@lru_cache() get_prompt_builder() → PromptBuilder
-@lru_cache() get_embedding_service() → EmbeddingService
-@lru_cache() get_knowledge_client() → KnowledgeClient
-@lru_cache() get_knowledge_seeder() → KnowledgeSeeder
-@lru_cache() get_scorecard_client() → ScorecardClient
-@lru_cache() get_udp_client() → UdpEventClient
-@lru_cache() get_remediation_graph() → RemediationGraph
-@lru_cache() get_session_store() → SessionStore
-@lru_cache() get_agent_service() → AgentService
+@asynccontextmanager
+async def datadog_mcp_session(dd_api_key: str, dd_app_key: str, site: str = "datadoghq.com") -> AsyncIterator[ClientSession]:
+    base = settings.datadog_mcp_url or f"https://coterm.{site}/mcp"
+    url = f"{base}?toolsets=all"
+    headers = {"DD-API-KEY": dd_api_key, "DD-APPLICATION-KEY": dd_app_key}
+    async with sse_client(url, headers=headers) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            yield session
 ```
 
-O `RemediationGraph` é singleton — serviços são injetados na construção. Dados
-por-request (github_token, tenant_id) vêm do estado do grafo (`state["ai_config"]`),
-não do construtor.
+- Credenciais DD vêm do `DatadogConfigClient` (busca em `/v1/internal/ai/datadog-config` na titlis-api)
+- Sessão dura o turn; descartada ao final — **nunca persistida, nunca logada**
+- `DATADOG_MCP_URL` em `settings.py` permite override para testes (ex: servidor local)
 
-O `AgentService` usa o `SessionStore` para persistir histórico de conversa entre turns.
-Sessões expiram após 3600s de inatividade (TTL não renova a cada acesso).
+### DatadogConfigClient (`src/infrastructure/titlis_api/datadog_config_client.py`)
 
----
-
-## 10. Variáveis de Ambiente
-
-```bash
-# Auth interna
-TITLIS_AI_INTERNAL_SECRET=titlis-ai-internal-secret
-
-# titlis-api (para ScorecardClient e KnowledgeClient)
-TITLIS_API_BASE_URL=http://titlis-api:8080
-TITLIS_API_INTERNAL_SECRET=titlis-internal-secret
-
-# UDP (para UdpEventClient)
-TITLIS_API_UDP_HOST=titlis-api
-TITLIS_API_UDP_PORT=8125
-
-# Logging
-LOG_LEVEL=INFO
-LOG_FORMAT=json
+HTTP client que busca credenciais Datadog do tenant na titlis-api:
+```python
+class DatadogConfigClient:
+    async def get_dd_config(self, tenant_id: int) -> Optional[Dict[str, Any]]:
+        # GET /v1/internal/ai/datadog-config?tenant_id=X
+        # Retorna None em 404 (credenciais não configuradas)
+        # Loga warning e retorna None em erro de rede
 ```
 
 ---
 
-## 11. Comandos
-
-```bash
-make dev-install     # poetry install --with dev
-make test            # pytest tests/ -v --tb=short --cov=src
-make test-unit       # pytest tests/unit/ -v
-make lint            # flake8 + black --check + mypy --ignore-missing-imports
-make format          # black src/ tests/
-make run             # uvicorn src.main:app --reload --port 8001
-```
-
----
-
-## 12. Fase 5 — Agente Conversacional (Human-in-the-Loop)
+## 9. Agente Conversacional (Human-in-the-Loop)
 
 ### AgentSession e SessionStore (`src/pipeline/session.py`)
 
@@ -414,13 +316,38 @@ class SessionStore:
 
 ### AgentService (`src/services/agent_service.py`)
 
-- `run_turn(session, user_message)` → AsyncGenerator de eventos SSE
-- `run_tool_responses(session, decisions)` → AsyncGenerator de eventos SSE
+- `run_turn(session, user_message)` → `AsyncGenerator` de eventos SSE
+- `run_tool_responses(session, decisions)` → `AsyncGenerator` de eventos SSE
 - `_llm_loop()` — até 5 iterações; detecta `finish_reason == "tool_calls"` e pausa
 - `_stream_llm()` — acumula deltas de tool calls por `tc.index` (LiteLLM streaming)
-- `_WRITE_TOOLS` — set de nomes de tools que modificam estado (badge âmbar na UI)
+- `_WRITE_TOOLS` — set de 14 nomes de tools MCP GitHub que modificam estado (badge âmbar na UI)
 - `_TOOL_DESC` — dict `tool_name → descrição PT-BR` exibida no card de aprovação
 - System prompt: persona ARIA, escopo K8s/SRE, prefixo `FORA_DO_ESCOPO:` para rejeição
+
+### _ToolRunner (classe interna de AgentService)
+
+Roteador de execução de tools. Cada `run_turn()` / `run_tool_responses()` abre um
+`AsyncExitStack` que inicializa as sessões MCP necessárias:
+
+```python
+class _ToolRunner:
+    def __init__(self, adapter, gh_session, dd_session, gh_tool_names, dd_tool_names): ...
+    async def execute(self, tool_name: str, args: Dict) -> Any:
+        if tool_name in self.gh_tool_names:
+            return await self.gh_session.call_tool(tool_name, args)
+        if tool_name in self.dd_tool_names:
+            return await self.dd_session.call_tool(tool_name, args)
+        return await self.adapter.execute(tool_name, args)
+```
+
+**Degradação graciosa:** se a sessão GitHub ou Datadog falhar na inicialização
+(binário ausente, credenciais inválidas), o turn continua com as tools disponíveis — sem crash.
+
+### _build_runner() (método de AgentService)
+
+Chamado dentro do `AsyncExitStack` de cada turn. Abre sessões MCP via `stack.enter_async_context()`,
+descobre as listas de tools disponíveis via `session.list_tools()`, e constrói o `_ToolRunner`.
+Gera a lista final de tools (openai format) somando: tools customizadas + tools MCP GitHub + tools MCP DD.
 
 ### Endpoints (`src/routes/agent.py`)
 
@@ -469,15 +396,181 @@ class AgentToolsRespondRequest(BaseModel):
 
 ---
 
-## 13. O Que Não Fazer
+## 10. LangGraph Pipeline (Remediação Unitária)
 
-- **Nunca** chame APIs externas (OpenAI, GitHub) em testes — use `AsyncMock`
-- **Nunca** instancie `RemediationGraph` fora de `bootstrap/dependencies.py` — quebra o DI
-- **Nunca** instancie `AgentService` ou `SessionStore` fora de `bootstrap/dependencies.py`
-- **Nunca** reduza CPU/memory em PRs — a validação never-reduce é obrigatória antes de `create_remediation_pr`
+### Estado (`src/pipeline/state.py`)
+
+```python
+class ScorecardRemediationState(TypedDict, total=False):
+    tenant_id: int
+    workload_id: str          # k8s_uid
+    finding_ids: List[str]
+    repo_url: str
+    deploy_manifest_path: str
+    ai_config: Dict[str, Any]
+    findings: List[Dict[str, Any]]
+    namespace: str
+    deployment_name: str
+    rag_context: List[Dict[str, Any]]
+    current_manifest: Optional[str]
+    live_deployment: Optional[Dict[str, Any]]
+    existing_pr: Optional[Dict[str, Any]]
+    analysis: Optional[str]
+    patched_manifest: Optional[str]
+    validation_errors: List[str]
+    retry_count: int
+    approved: Optional[bool]
+    pr_result: Optional[Dict[str, Any]]
+```
+
+### RemediationGraph (`src/pipeline/graph.py`)
+
+Singleton, compilado com `MemorySaver()` checkpointer. Usa `github_mcp_session()` para
+operações GitHub. Importa `_never_reduce_violated` e `_check_never_reduce` de `github_tools.py`.
+
+**9 nós:**
+
+| Nó | O que faz |
+|---|---|
+| `classify_findings` | Busca scorecard por k8s_uid; filtra findings pelos `finding_ids`; seta `namespace`, `deployment_name` |
+| `fetch_context` | Paralelo via `asyncio.gather`: RAG (embedding + search) + leitura do manifest via MCP GitHub |
+| `check_existing_pr` | Verifica PR aberto via MCP GitHub; seta `existing_pr` |
+| `analyze_findings` | LLM `chat()` com findings + manifest + contexto RAG |
+| `generate_yaml_patch` | LLM gera YAML patchado; strip de markdown fences; incrementa `retry_count`; limpa `validation_errors` |
+| `validate_patch` | `yaml.safe_load()` + `_check_never_reduce()` linha a linha |
+| `await_user_confirmation` | `interrupt({patched_manifest, current_manifest, findings, ...})`; pausa o grafo |
+| `create_remediation_pr` | Cria branch → commit → PR via MCP GitHub |
+| `notify_api` | Envia UDP `remediation_started` para titlis-api:8125 |
+
+**Topologia:**
+```
+START → classify_findings → fetch_context → check_existing_pr
+check_existing_pr --condicional--> analyze_findings | END (PR já existe)
+analyze_findings → generate_yaml_patch → validate_patch
+validate_patch --condicional--> generate_yaml_patch (retry, max 3) | END (esgotou) | await_user_confirmation
+await_user_confirmation --condicional--> create_remediation_pr | END (rejeitado)
+create_remediation_pr → notify_api → END
+```
+
+### github_tools.py — apenas utilitários never-reduce
+
+`src/tools/github_tools.py` **não** expõe mais `build_github_tools()`. Contém apenas:
+```python
+def _never_reduce_violated(current: str, suggested: str) -> bool: ...
+def _check_never_reduce(current_yaml: str, patched_yaml: str) -> Optional[str]: ...
+def _parse_repo(repo_url: str) -> Tuple[str, str]: ...
+def _extract_container_resources(yaml_text: str) -> Dict[Tuple[str, str], str]: ...
+```
+Importados por `graph.py`. Nenhuma outra parte do código deve importar deste arquivo.
+
+### UdpEventClient (`src/infrastructure/udp_client.py`)
+
+Envelope UDP padrão: `{v:1, t:event_type, ts:..., tenant_id:..., data:...}`.
+Envia via `socket.SOCK_DGRAM` usando `run_in_executor` (não bloqueia event loop).
+Host padrão: `titlis-api`, porta: 8125.
+
+### Endpoints SSE (`src/routes/remediate.py`)
+
+**`POST /v1/remediate`** — inicia o pipeline:
+- Gera `thread_id` (UUID)
+- Roda `graph.compiled.astream(initial_state, config, stream_mode="updates")`
+- Detecta `__interrupt__` → emite evento SSE `fix_ready` com `thread_id`
+- Ao final → emite `done`
+
+**`POST /v1/remediate/{thread_id}/confirm`** — retoma grafo pausado:
+- Roda `graph.compiled.astream(Command(resume=body.approved), config, stream_mode="updates")`
+- Detecta nó `create_remediation_pr` → emite `pr_created`
+- Ao final → emite `done`
+
+**Tipos de eventos SSE:**
+
+| Tipo | Quando |
+|---|---|
+| `fix_ready` | Grafo pausa para confirmação humana (inclui `thread_id`, `patched_manifest`, `current_manifest`, `findings`) |
+| `existing_pr` | PR já existe — retorna `pr_url` e encerra |
+| `progress` | A cada nó concluído (inclui `node` name) |
+| `pr_created` | PR criado com sucesso (inclui `pr_url`, `pr_number`, `branch`) |
+| `error` | Exceção não tratada no pipeline |
+| `done` | Sempre o último evento do stream |
+
+---
+
+## 11. Dependências Singleton (`src/bootstrap/dependencies.py`)
+
+```python
+@lru_cache() get_llm_service() → LLMService
+@lru_cache() get_prompt_builder() → PromptBuilder
+@lru_cache() get_embedding_service() → EmbeddingService
+@lru_cache() get_knowledge_client() → KnowledgeClient
+@lru_cache() get_knowledge_seeder() → KnowledgeSeeder
+@lru_cache() get_scorecard_client() → ScorecardClient
+@lru_cache() get_udp_client() → UdpEventClient
+@lru_cache() get_remediation_graph() → RemediationGraph
+@lru_cache() get_session_store() → SessionStore
+@lru_cache() get_datadog_config_client() → DatadogConfigClient
+@lru_cache() get_agent_service() → AgentService  # recebe dd_client=get_datadog_config_client()
+```
+
+O `RemediationGraph` é singleton — serviços são injetados na construção. Dados
+por-request (github_token, tenant_id) vêm do estado do grafo (`state["ai_config"]`),
+não do construtor.
+
+O `AgentService` usa o `SessionStore` para persistir histórico de conversa entre turns.
+Sessões expiram após 3600s de inatividade (TTL não renova a cada acesso).
+
+As sessões MCP (`github_mcp_session`, `datadog_mcp_session`) **não são singletons** —
+são abertas por turn dentro do `AsyncExitStack` e fechadas ao final do turn.
+
+---
+
+## 12. Variáveis de Ambiente
+
+```bash
+# Auth interna
+TITLIS_AI_INTERNAL_SECRET=titlis-ai-internal-secret
+
+# titlis-api (para ScorecardClient, KnowledgeClient, DatadogConfigClient)
+TITLIS_API_BASE_URL=http://titlis-api:8080
+TITLIS_API_INTERNAL_SECRET=titlis-internal-secret
+
+# UDP (para UdpEventClient)
+TITLIS_API_UDP_HOST=titlis-api
+TITLIS_API_UDP_PORT=8125
+
+# MCP Datadog (opcional — override do endpoint padrão coterm.datadoghq.com)
+# Útil para apontar para mock local em testes de integração
+DATADOG_MCP_URL=
+
+# Logging
+LOG_LEVEL=INFO
+LOG_FORMAT=json
+```
+
+---
+
+## 13. Comandos
+
+```bash
+make dev-install     # poetry install --with dev
+make test            # pytest tests/ -v --tb=short --cov=src
+make test-unit       # pytest tests/unit/ -v
+make lint            # flake8 + black --check + mypy --ignore-missing-imports
+make format          # black src/ tests/
+make run             # uvicorn src.main:app --reload --port 8001
+```
+
+---
+
+## 14. O Que Não Fazer
+
+- **Nunca** chame APIs externas (OpenAI, GitHub, Datadog) em testes — use `AsyncMock`
+- **Nunca** instancie `RemediationGraph`, `AgentService` ou `SessionStore` fora de `bootstrap/dependencies.py`
+- **Nunca** reduza CPU/memory em PRs — `_check_never_reduce()` é obrigatório antes de `create_remediation_pr`
 - **Nunca** acesse o cluster Kubernetes — o titlis-ai não tem kubeconfig
 - **Nunca** emita `pr_created` sem ter confirmação do usuário (`await_user_confirmation`)
 - **Nunca** capture `except ValueError` ao redor de código SLO — `SloValidationError` herda de `ValueError`
-- **Nunca** passe `github_token` no estado global do grafo — ele vem do `ai_config` da request
-- **Nunca** execute uma write tool sem aprovação explícita do usuário via `AgentToolDecision.approved`
+- **Nunca** passe `github_token` ou credenciais Datadog em variável de ambiente global — vêm por request
+- **Nunca** execute uma write tool sem aprovação explícita via `AgentToolDecision.approved`
 - **Nunca** adicione docstrings — código deve ser autoexplicativo
+- **Nunca** persista, logue ou retorne credenciais Datadog — use em memória e descarte ao fim do turn
+- **Nunca** adicione lógica de campanhas em frota (bulk GitHub) — esse caminho foi arquivado; PRs são sempre unitários

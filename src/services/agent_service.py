@@ -1,61 +1,204 @@
 import json
 import uuid
-from typing import Any, AsyncGenerator, Dict, List
+from contextlib import AsyncExitStack
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 
 import litellm
 
 from src.domain.models import AgentToolDecision, TenantAiConfig, ToolProposal
+from src.infrastructure.mcp.datadog_mcp import datadog_mcp_session
+from src.infrastructure.mcp.github_mcp import github_mcp_session
+from src.infrastructure.titlis_api.datadog_config_client import DatadogConfigClient
 from src.infrastructure.titlis_api.scorecard_client import ScorecardClient
 from src.pipeline.session import AgentSession, SessionStore
 from src.services.mcp_adapter import McpAdapter
-from src.tools.campaign_tools import build_campaign_tools
-from src.tools.github_tools import build_github_tools
 from src.tools.read_tools import build_read_tools
 from src.tools.slo_tools import build_slo_tools
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_WRITE_TOOLS = {"create_remediation_pr", "update_slo_thresholds", "trigger_bulk_pr_campaign"}
+# GitHub MCP tools que modificam estado — exigem aprovação humana antes de executar.
+_WRITE_TOOLS: Set[str] = {
+    "update_slo_thresholds",
+    # GitHub MCP write tools
+    "create_pull_request",
+    "push_files",
+    "create_or_update_file",
+    "merge_pull_request",
+    "create_branch",
+    "create_repository",
+    "delete_file",
+    "update_pull_request",
+    "create_issue",
+    "update_issue",
+    "add_issue_comment",
+    "create_pull_request_review",
+    "request_copilot_review",
+}
 
-_SYSTEM_PROMPT = """Você é ARIA (Assistente de Remediação Inteligente Autônoma), especialista em operações SRE Kubernetes na plataforma Titlis.
+_SYSTEM_PROMPT_BASE = """Você é ARIA (Assistente de Remediação Inteligente Autônoma), especialista em operações SRE Kubernetes na plataforma Titlis.
 
-Domínio exclusivo de atuação:
+Domínio de atuação:
 - Análise de findings de scorecard de compliance Kubernetes
 - Diagnóstico de problemas de workloads (resource limits, liveness/readiness probes, HPA, anotações)
 - Remediação de Deployments com abertura de Pull Requests no GitHub
 - Consulta e ajuste de SLOs
 - Leitura de histórico de remediações anteriores
+- Consulta a repositórios, branches, arquivos e PRs no GitHub (suporte à remediação)
+- Consulta a métricas, monitors, dashboards e infraestrutura no Datadog (suporte a análise de incidentes)
 
-Se o usuário perguntar sobre algo FORA deste domínio, responda EXATAMENTE com:
+Se o usuário perguntar sobre algo completamente fora deste domínio (ex: receitas, esportes, política), responda EXATAMENTE com:
 FORA_DO_ESCOPO: <explicação objetiva do que está fora do escopo e o que você pode ajudar>
 
 Ao analisar problemas:
 1. Use as ferramentas disponíveis para buscar dados reais ANTES de pedir informações ao usuário
 2. Quando o namespace não for informado, use list_all_workloads para descobrir os workloads disponíveis
 3. Nunca pergunte por namespace, workload_id ou outros dados que você pode buscar com as ferramentas
-4. Seja objetivo e técnico nas respostas
+4. Para criar PRs de remediação, use as ferramentas do GitHub MCP (create_branch, push_files, create_pull_request)
+5. Valide que resources nunca são reduzidos antes de criar PRs (never-reduce policy)
+6. Seja objetivo e técnico nas respostas
 
 Idioma: português brasileiro."""
 
+_SYSTEM_PROMPT = _SYSTEM_PROMPT_BASE
+
+
+def _build_system_prompt(has_github: bool, has_datadog: bool) -> str:
+    parts = [_SYSTEM_PROMPT_BASE]
+    if has_datadog:
+        parts.append("\nVocê tem acesso às ferramentas do Datadog MCP para consultar métricas, monitors, dashboards e infraestrutura.")
+    else:
+        parts.append("\nAVISO: As ferramentas do Datadog NÃO estão disponíveis nesta sessão. Se o usuário perguntar sobre métricas ou dados do Datadog, informe que as credenciais não estão configuradas e oriente a acessar Configurações → Integrações.")
+    if not has_github:
+        parts.append("AVISO: As ferramentas do GitHub NÃO estão disponíveis nesta sessão. Não é possível criar branches, commits ou Pull Requests.")
+    return "\n".join(parts)
+
+
+class _ToolRunner:
+    def __init__(
+        self,
+        adapter: McpAdapter,
+        openai_tools: List[Dict[str, Any]],
+        github_session: Any,
+        dd_session: Any,
+        github_tool_names: Set[str],
+        dd_tool_names: Set[str],
+        has_github: bool = False,
+        has_datadog: bool = False,
+    ) -> None:
+        self._adapter = adapter
+        self.openai_tools = openai_tools
+        self._github_session = github_session
+        self._dd_session = dd_session
+        self._github_tool_names = github_tool_names
+        self._dd_tool_names = dd_tool_names
+        self.has_github = has_github
+        self.has_datadog = has_datadog
+
+    async def execute(self, tool_name: str, args: Dict[str, Any]) -> Any:
+        if tool_name in self._github_tool_names and self._github_session is not None:
+            result = await self._github_session.call_tool(tool_name, args)
+            return _parse_mcp_result(result)
+        if tool_name in self._dd_tool_names and self._dd_session is not None:
+            result = await self._dd_session.call_tool(tool_name, args)
+            return _parse_mcp_result(result)
+        return await self._adapter.execute(tool_name, args)
+
 
 class AgentService:
-    def __init__(self, scorecard_client: ScorecardClient, session_store: SessionStore) -> None:
+    def __init__(
+        self,
+        scorecard_client: ScorecardClient,
+        session_store: SessionStore,
+        dd_client: DatadogConfigClient,
+    ) -> None:
         self._scorecard = scorecard_client
         self._store = session_store
+        self._dd_client = dd_client
 
-    def _build_adapter(self, session: AgentSession) -> McpAdapter:
+    async def _build_runner(self, session: AgentSession, stack: AsyncExitStack) -> _ToolRunner:
         ai_cfg = session.ai_config
         tenant_id = session.tenant_id
-        registries = [build_read_tools(self._scorecard, tenant_id)]
-        registries.append(build_slo_tools(self._scorecard, tenant_id))
+
+        adapter = McpAdapter(
+            build_read_tools(self._scorecard, tenant_id),
+            build_slo_tools(self._scorecard, tenant_id),
+        )
+        custom_tools = adapter.to_openai_tools()
+
+        github_session: Optional[Any] = None
+        github_tool_names: Set[str] = set()
+        github_mcp_tools: List[Dict[str, Any]] = []
+        github_auth_mode = ai_cfg.get("github_auth_mode", "pat")
         github_token = ai_cfg.get("github_token")
-        if github_token:
-            base_branch = ai_cfg.get("github_base_branch", "main")
-            registries.append(build_github_tools(github_token, base_branch, tenant_id, self._scorecard))
-            actor_email = ai_cfg.get("actor_email")
-            registries.append(build_campaign_tools(tenant_id=tenant_id, actor_email=actor_email))
-        return McpAdapter(*registries)
+        github_app_id = ai_cfg.get("github_app_id")
+        github_app_private_key = ai_cfg.get("github_app_private_key")
+        github_app_installation_id = ai_cfg.get("github_app_installation_id")
+
+        if github_auth_mode == "github_app" and github_app_id and github_app_private_key and github_app_installation_id:
+            try:
+                github_session = await stack.enter_async_context(
+                    github_mcp_session(
+                        github_app_id=github_app_id,
+                        github_app_private_key=github_app_private_key,
+                        github_app_installation_id=github_app_installation_id,
+                    )
+                )
+                tool_list = await github_session.list_tools()
+                for tool in tool_list.tools:
+                    github_tool_names.add(tool.name)
+                    github_mcp_tools.append(_tool_to_openai(tool))
+                logger.info("GitHub App MCP iniciado", extra={"tenant_id": tenant_id, "tool_count": len(github_tool_names)})
+            except Exception:
+                logger.exception("GitHub App MCP init falhou — sem tools GitHub neste turno")
+        elif github_token:
+            try:
+                github_session = await stack.enter_async_context(github_mcp_session(github_token=github_token))
+                tool_list = await github_session.list_tools()
+                for tool in tool_list.tools:
+                    github_tool_names.add(tool.name)
+                    github_mcp_tools.append(_tool_to_openai(tool))
+                logger.info("GitHub MCP iniciado", extra={"tenant_id": tenant_id, "tool_count": len(github_tool_names)})
+            except Exception:
+                logger.exception("GitHub MCP init falhou — sem tools GitHub neste turno")
+
+        dd_session: Optional[Any] = None
+        dd_tool_names: Set[str] = set()
+        dd_mcp_tools: List[Dict[str, Any]] = []
+        try:
+            dd_config = await self._dd_client.get_dd_config(tenant_id)
+            dd_api_key = (dd_config or {}).get("ddApiKey") or ""
+            dd_app_key = (dd_config or {}).get("ddAppKey") or ""
+            if dd_api_key:
+                dd_session = await stack.enter_async_context(
+                    datadog_mcp_session(
+                        dd_api_key,
+                        dd_app_key,
+                        (dd_config or {}).get("site", "datadoghq.com"),
+                    )
+                )
+                tool_list = await dd_session.list_tools()
+                for tool in tool_list.tools:
+                    dd_tool_names.add(tool.name)
+                    dd_mcp_tools.append(_tool_to_openai(tool))
+                logger.info("Datadog MCP iniciado", extra={"tenant_id": tenant_id, "tool_count": len(dd_tool_names)})
+            else:
+                logger.info("Datadog MCP ignorado — credenciais não configuradas", extra={"tenant_id": tenant_id})
+        except Exception:
+            logger.exception("Datadog MCP init falhou — sem tools Datadog neste turno")
+
+        all_tools = custom_tools + github_mcp_tools + dd_mcp_tools
+        return _ToolRunner(
+            adapter=adapter,
+            openai_tools=all_tools,
+            github_session=github_session,
+            dd_session=dd_session,
+            github_tool_names=github_tool_names,
+            dd_tool_names=dd_tool_names,
+            has_github=bool(github_tool_names),
+            has_datadog=bool(dd_tool_names),
+        )
 
     def _ai_config(self, session: AgentSession) -> TenantAiConfig:
         cfg = session.ai_config
@@ -69,65 +212,103 @@ class AgentService:
             tokens_used_month=cfg.get("tokens_used_month", 0),
         )
 
-    async def run_turn(
-        self, session: AgentSession, user_message: str
-    ) -> AsyncGenerator[str, None]:
+    async def run_turn(self, session: AgentSession, user_message: str) -> AsyncGenerator[str, None]:
         session.messages.append({"role": "user", "content": user_message})
         session.append_audit({"event": "user_message", "content": user_message})
 
-        adapter = self._build_adapter(session)
         ai_config = self._ai_config(session)
-        messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + session.messages
-        tools = adapter.to_openai_tools()
         model_id = _build_model_id(ai_config.provider, ai_config.model)
 
-        async for event in self._llm_loop(session, messages, tools, model_id, ai_config, adapter):
-            yield event
+        async with AsyncExitStack() as stack:
+            runner = await self._build_runner(session, stack)
+            system_prompt = _build_system_prompt(runner.has_github, runner.has_datadog)
+            messages = [{"role": "system", "content": system_prompt}] + session.messages
+            async for event in self._llm_loop(session, messages, runner.openai_tools, model_id, ai_config, runner, system_prompt):
+                yield event
 
     async def run_tool_responses(
         self, session: AgentSession, decisions: List[AgentToolDecision]
     ) -> AsyncGenerator[str, None]:
-        adapter = self._build_adapter(session)
         ai_config = self._ai_config(session)
         model_id = _build_model_id(ai_config.provider, ai_config.model)
 
         proposal_map = {p.proposal_id: p for p in session.pending_proposals}
         session.pending_proposals = []
 
-        for decision in decisions:
-            proposal = proposal_map.get(decision.proposal_id)
-            if proposal is None:
-                continue
+        async with AsyncExitStack() as stack:
+            runner = await self._build_runner(session, stack)
+            system_prompt = _build_system_prompt(runner.has_github, runner.has_datadog)
 
-            session.append_audit({
-                "event": "tool_decision",
-                "tool": proposal.tool_name,
-                "approved": decision.approved,
-                "proposal_id": decision.proposal_id,
-            })
+            for decision in decisions:
+                proposal = proposal_map.get(decision.proposal_id)
+                if proposal is None:
+                    continue
 
-            if decision.approved:
-                args = decision.edited_args if decision.edited_args is not None else proposal.args
-                try:
-                    result = await adapter.execute(proposal.tool_name, args)
-                    result_str = json.dumps(result, ensure_ascii=False, default=str)
-                    session.append_audit({"event": "tool_result", "tool": proposal.tool_name, "result": result_str[:500]})
-                    yield _sse({"type": "tool_result", "proposal_id": decision.proposal_id, "tool_name": proposal.tool_name, "approved": True, "result": result})
-                    session.messages.append({"role": "tool", "tool_call_id": decision.proposal_id, "content": result_str})
-                except Exception as exc:
-                    err = str(exc)
-                    session.append_audit({"event": "tool_error", "tool": proposal.tool_name, "error": err})
-                    yield _sse({"type": "tool_result", "proposal_id": decision.proposal_id, "tool_name": proposal.tool_name, "approved": True, "error": err})
-                    session.messages.append({"role": "tool", "tool_call_id": decision.proposal_id, "content": f"Erro: {err}"})
-            else:
-                yield _sse({"type": "tool_result", "proposal_id": decision.proposal_id, "tool_name": proposal.tool_name, "approved": False})
-                session.messages.append({"role": "tool", "tool_call_id": decision.proposal_id, "content": "Usuário rejeitou a execução desta ferramenta."})
+                session.append_audit(
+                    {
+                        "event": "tool_decision",
+                        "tool": proposal.tool_name,
+                        "approved": decision.approved,
+                        "proposal_id": decision.proposal_id,
+                    }
+                )
 
-        messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + session.messages
-        tools = adapter.to_openai_tools()
+                if decision.approved:
+                    args = decision.edited_args if decision.edited_args is not None else proposal.args
+                    try:
+                        result = await runner.execute(proposal.tool_name, args)
+                        result_str = json.dumps(result, ensure_ascii=False, default=str)
+                        session.append_audit(
+                            {"event": "tool_result", "tool": proposal.tool_name, "result": result_str[:500]}
+                        )
+                        yield _sse(
+                            {
+                                "type": "tool_result",
+                                "proposal_id": decision.proposal_id,
+                                "tool_name": proposal.tool_name,
+                                "approved": True,
+                                "result": result,
+                            }
+                        )
+                        session.messages.append(
+                            {"role": "tool", "tool_call_id": decision.proposal_id, "content": result_str}
+                        )
+                    except Exception as exc:
+                        err = str(exc)
+                        session.append_audit({"event": "tool_error", "tool": proposal.tool_name, "error": err})
+                        yield _sse(
+                            {
+                                "type": "tool_result",
+                                "proposal_id": decision.proposal_id,
+                                "tool_name": proposal.tool_name,
+                                "approved": True,
+                                "error": err,
+                            }
+                        )
+                        session.messages.append(
+                            {"role": "tool", "tool_call_id": decision.proposal_id, "content": f"Erro: {err}"}
+                        )
+                else:
+                    yield _sse(
+                        {
+                            "type": "tool_result",
+                            "proposal_id": decision.proposal_id,
+                            "tool_name": proposal.tool_name,
+                            "approved": False,
+                        }
+                    )
+                    session.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": decision.proposal_id,
+                            "content": "Usuário rejeitou a execução desta ferramenta.",
+                        }
+                    )
 
-        async for event in self._llm_loop(session, messages, tools, model_id, ai_config, adapter):
-            yield event
+            messages = [{"role": "system", "content": system_prompt}] + session.messages
+
+            async for event in self._llm_loop(session, messages, runner.openai_tools, model_id, ai_config, runner, system_prompt):
+                yield event
 
     async def _llm_loop(
         self,
@@ -136,7 +317,8 @@ class AgentService:
         tools: List[Dict[str, Any]],
         model_id: str,
         ai_config: TenantAiConfig,
-        adapter: McpAdapter,
+        runner: _ToolRunner,
+        system_prompt: str = _SYSTEM_PROMPT,
     ) -> AsyncGenerator[str, None]:
         for _iteration in range(5):
             result: Dict[str, Any] = {}
@@ -180,25 +362,33 @@ class AgentService:
 
                 for proposal in read_proposals:
                     try:
-                        tool_result = await adapter.execute(proposal.tool_name, proposal.args)
+                        tool_result = await runner.execute(proposal.tool_name, proposal.args)
                         result_str = json.dumps(tool_result, ensure_ascii=False, default=str)
-                        session.append_audit({"event": "tool_result", "tool": proposal.tool_name, "result": result_str[:500]})
-                        session.messages.append({"role": "tool", "tool_call_id": proposal.proposal_id, "content": result_str})
+                        session.append_audit(
+                            {"event": "tool_result", "tool": proposal.tool_name, "result": result_str[:500]}
+                        )
+                        session.messages.append(
+                            {"role": "tool", "tool_call_id": proposal.proposal_id, "content": result_str}
+                        )
                     except Exception as exc:
                         err = str(exc)
                         session.append_audit({"event": "tool_error", "tool": proposal.tool_name, "error": err})
-                        session.messages.append({"role": "tool", "tool_call_id": proposal.proposal_id, "content": f"Erro: {err}"})
+                        session.messages.append(
+                            {"role": "tool", "tool_call_id": proposal.proposal_id, "content": f"Erro: {err}"}
+                        )
 
                 if write_proposals:
                     session.pending_proposals = write_proposals
-                    yield _sse({
-                        "type": "awaiting_approvals",
-                        "proposals": [p.model_dump() for p in write_proposals],
-                    })
+                    yield _sse(
+                        {
+                            "type": "awaiting_approvals",
+                            "proposals": [p.model_dump() for p in write_proposals],
+                        }
+                    )
                     yield _sse({"type": "done"})
                     return
 
-                messages = [{"role": "system", "content": _SYSTEM_PROMPT}] + session.messages
+                messages = [{"role": "system", "content": system_prompt}] + session.messages
                 continue
 
             if text_acc:
@@ -221,6 +411,7 @@ class AgentService:
         result: Dict[str, Any],
     ) -> AsyncGenerator[str, None]:
         text_acc = ""
+        thinking_acc = ""
         tool_calls_acc: Dict[int, Dict[str, Any]] = {}
         finish_reason = None
 
@@ -234,6 +425,8 @@ class AgentService:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        if _needs_thinking_param(ai_config.provider, ai_config.model):
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
 
         response = await litellm.acompletion(**kwargs)
 
@@ -243,9 +436,13 @@ class AgentService:
                 finish_reason = choice.finish_reason
             delta = choice.delta
 
+            thinking_chunk = _extract_thinking(delta)
+            if thinking_chunk:
+                thinking_acc += thinking_chunk
+                yield thinking_chunk
+
             if delta.content:
                 text_acc += delta.content
-                yield delta.content
 
             if hasattr(delta, "tool_calls") and delta.tool_calls:
                 for tc in delta.tool_calls:
@@ -266,20 +463,51 @@ class AgentService:
                 "model": model_id,
                 "finish_reason": finish_reason,
                 "tool_calls": len(tool_calls_acc),
+                "thinking_tokens": len(thinking_acc),
             },
         )
         result["text_acc"] = text_acc
+        result["thinking_acc"] = thinking_acc
         result["tool_calls_acc"] = tool_calls_acc
         result["finish_reason"] = finish_reason
 
 
+_PROVIDER_ALIASES = {
+    "google": "gemini",
+}
+
+
 def _build_model_id(provider: str, model: str) -> str:
-    # litellm model IDs use "<provider>/<model>" format.
-    # If model already contains a "/" (e.g. "gemini/gemini-2.0-flash"), use it as-is
-    # to avoid double-prefixing (e.g. "google/gemini/gemini-2.0-flash" is invalid).
     if "/" in model:
         return model
-    return f"{provider}/{model}"
+    normalized = _PROVIDER_ALIASES.get(provider, provider)
+    return f"{normalized}/{model}"
+
+
+def _tool_to_openai(tool: Any) -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description or "",
+            "parameters": tool.inputSchema if isinstance(tool.inputSchema, dict) else {},
+        },
+    }
+
+
+def _parse_mcp_result(result: Any) -> Any:
+    content = getattr(result, "content", None)
+    if not content:
+        return {}
+    if len(content) == 1:
+        item = content[0]
+        text = getattr(item, "text", None)
+        if text:
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                return {"text": text}
+    return [{"type": getattr(c, "type", "text"), "text": getattr(c, "text", str(c))} for c in content]
 
 
 def _build_proposals(tool_calls_acc: Dict[int, Dict[str, Any]]) -> List[ToolProposal]:
@@ -290,17 +518,20 @@ def _build_proposals(tool_calls_acc: Dict[int, Dict[str, Any]]) -> List[ToolProp
         except json.JSONDecodeError:
             args = {}
         tool_name = tc["name"]
-        proposals.append(ToolProposal(
-            proposal_id=tc["id"] or str(uuid.uuid4()),
-            tool_name=tool_name,
-            description=_tool_description(tool_name),
-            args=args,
-            is_write=tool_name in _WRITE_TOOLS,
-        ))
+        proposals.append(
+            ToolProposal(
+                proposal_id=tc["id"] or str(uuid.uuid4()),
+                tool_name=tool_name,
+                description=_tool_description(tool_name),
+                args=args,
+                is_write=tool_name in _WRITE_TOOLS,
+            )
+        )
     return proposals
 
 
 _TOOL_DESC: Dict[str, str] = {
+    # Titlis read tools
     "list_all_workloads": "Listar todos os workloads do tenant",
     "get_deployment_spec": "Buscar dados do Deployment",
     "get_current_scorecard": "Buscar scorecard atual do workload",
@@ -308,13 +539,29 @@ _TOOL_DESC: Dict[str, str] = {
     "get_similar_resolved": "Buscar workloads que resolveram esta regra",
     "get_namespace_inventory": "Listar Deployments do namespace",
     "get_remediation_history": "Buscar histórico de remediações",
-    "read_deploy_manifest": "Ler manifesto YAML do repositório",
-    "check_existing_pr": "Verificar PR de remediação existente",
-    "create_remediation_pr": "Criar Pull Request de remediação no GitHub",
+    # Titlis SLO tools
     "get_slo_status": "Verificar status de SLO",
     "list_auto_created_slos": "Listar SLOs criados automaticamente",
     "update_slo_thresholds": "Atualizar thresholds de SLO",
-    "trigger_bulk_pr_campaign": "Disparar campanha de PRs em lote para múltiplos workloads",
+    # GitHub MCP tools
+    "create_pull_request": "Criar Pull Request no GitHub",
+    "push_files": "Enviar arquivos para repositório GitHub",
+    "create_or_update_file": "Criar ou atualizar arquivo no GitHub",
+    "create_branch": "Criar branch no GitHub",
+    "merge_pull_request": "Fazer merge de Pull Request",
+    "create_repository": "Criar repositório no GitHub",
+    "delete_file": "Deletar arquivo no GitHub",
+    "update_pull_request": "Atualizar Pull Request no GitHub",
+    "create_issue": "Criar issue no GitHub",
+    "update_issue": "Atualizar issue no GitHub",
+    "add_issue_comment": "Adicionar comentário em issue do GitHub",
+    "create_pull_request_review": "Criar revisão de Pull Request",
+    "get_file_contents": "Ler conteúdo de arquivo no GitHub",
+    "list_pull_requests": "Listar Pull Requests no GitHub",
+    "get_pull_request": "Buscar Pull Request no GitHub",
+    "search_repositories": "Buscar repositórios no GitHub",
+    "search_code": "Buscar código no GitHub",
+    "list_commits": "Listar commits no GitHub",
 }
 
 
@@ -324,3 +571,32 @@ def _tool_description(tool_name: str) -> str:
 
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _needs_thinking_param(provider: str, model: str) -> bool:
+    if provider == "anthropic":
+        return True
+    if provider in ("google", "gemini"):
+        return "gemini-2.5" in model or "gemini-3" in model
+    return False
+
+
+def _extract_thinking(delta: Any) -> str:
+    thinking_blocks = getattr(delta, "thinking_blocks", None)
+    if thinking_blocks:
+        parts = []
+        for block in thinking_blocks:
+            if isinstance(block, dict):
+                text = block.get("thinking", "")
+            else:
+                text = getattr(block, "thinking", "") or ""
+            if text:
+                parts.append(text)
+        if parts:
+            return "".join(parts)
+
+    reasoning = getattr(delta, "reasoning_content", None)
+    if reasoning:
+        return reasoning
+
+    return ""

@@ -17,6 +17,11 @@ class Settings(BaseSettings):
         validation_alias="TITLIS_API_URL",
     )
 
+    datadog_mcp_url: str = Field(
+        default="",
+        validation_alias="DATADOG_MCP_URL",
+    )
+
     rag_enabled: bool = Field(default=True, validation_alias="RAG_ENABLED")
     rag_top_k: int = Field(default=3, validation_alias="RAG_TOP_K")
 

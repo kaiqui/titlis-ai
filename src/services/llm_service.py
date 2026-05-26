@@ -9,6 +9,17 @@ logger = get_logger(__name__)
 
 BUDGET_WARNING_THRESHOLD = 0.80
 
+_PROVIDER_ALIASES = {
+    "google": "gemini",
+}
+
+
+def build_litellm_model_id(provider: str, model: str) -> str:
+    if "/" in model:
+        return model
+    normalized = _PROVIDER_ALIASES.get(provider, provider)
+    return f"{normalized}/{model}"
+
 
 class QuotaExceededError(Exception):
     def __init__(self, tenant_id: int, budget: int) -> None:
@@ -62,7 +73,7 @@ class LLMService:
         trace_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         self._check_quota(config, tenant_id)
-        model_id = f"{config.provider}/{config.model}"
+        model_id = build_litellm_model_id(config.provider, config.model)
         response = await litellm.acompletion(
             model=model_id,
             messages=messages,
@@ -90,7 +101,7 @@ class LLMService:
         trace_metadata: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
         self._check_quota(config, tenant_id)
-        model_id = f"{config.provider}/{config.model}"
+        model_id = build_litellm_model_id(config.provider, config.model)
         response = await litellm.acompletion(
             model=model_id,
             messages=messages,

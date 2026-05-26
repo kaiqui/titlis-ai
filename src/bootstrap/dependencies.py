@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from src.infrastructure.titlis_api.datadog_config_client import DatadogConfigClient
 from src.infrastructure.titlis_api.knowledge_client import KnowledgeClient
 from src.infrastructure.titlis_api.scorecard_client import ScorecardClient
 from src.pipeline.graph import RemediationGraph
@@ -45,6 +46,11 @@ def get_scorecard_client() -> ScorecardClient:
 
 
 @lru_cache()
+def get_datadog_config_client() -> DatadogConfigClient:
+    return DatadogConfigClient()
+
+
+@lru_cache()
 def get_remediation_graph() -> RemediationGraph:
     return RemediationGraph(
         llm_service=get_llm_service(),
@@ -64,4 +70,5 @@ def get_agent_service() -> AgentService:
     return AgentService(
         scorecard_client=get_scorecard_client(),
         session_store=get_session_store(),
+        dd_client=get_datadog_config_client(),
     )

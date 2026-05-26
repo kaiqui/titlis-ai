@@ -32,6 +32,7 @@ async def agent_chat(body: AgentChatRequest, request: Request) -> StreamingRespo
                 yield chunk
         except Exception as exc:
             import json
+
             logger.exception("Erro no agente", extra={"session_id": body.session_id})
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
@@ -64,6 +65,7 @@ async def agent_tools_respond(
                 yield chunk
         except Exception as exc:
             import json
+
             logger.exception("Erro ao responder tools", extra={"session_id": session_id})
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"

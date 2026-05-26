@@ -20,7 +20,7 @@ yaml_example: |
       apiVersion: apps/v1
       kind: Deployment
       name: app
-    minReplicas: 2
+    minreplicas: 1
     maxReplicas: 10
     metrics:
       - type: Resource

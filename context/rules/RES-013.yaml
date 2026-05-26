@@ -8,11 +8,11 @@ why: |
   disponibilidade serem violados. Rolling updates também causam momentos de zero réplicas.
 impact: "SPOF: falha de um único nó derruba o serviço completamente."
 fix_hint: |
-  Configure spec.replicas: 2 como mínimo. Adicione PodAntiAffinity para garantir que
+  Configure spec.replicas: 1 como mínimo. Adicione PodAntiAffinity para garantir que
   as réplicas fiquem em nós físicos diferentes, eliminando o SPOF no nível de nó.
 yaml_example: |
   spec:
-    replicas: 2
+    replicas: 1
     template:
       spec:
         affinity:

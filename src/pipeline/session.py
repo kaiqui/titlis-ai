@@ -38,6 +38,7 @@ class SessionStore:
                 ai_config=ai_config,
             )
         session = self._sessions[session_id]
+        session.ai_config = ai_config
         session.touch()
         return session
 
