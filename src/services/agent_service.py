@@ -61,18 +61,45 @@ Ao analisar problemas:
 
 ## Descoberta automática de repositório e manifests
 
+### ⚠️ Docker Hub ≠ GitHub — regra crítica
+
+O namespace do Docker Hub (`containers[].image`, ex: `kailima/titlis-api:v1.2`) **NÃO corresponde**
+ao owner/repositório no GitHub. São plataformas com usuários separados e independentes.
+
+**NUNCA** infira o owner ou repositório GitHub a partir de:
+- Nome da imagem Docker (`containers[].image` ou `image_tag`)
+- Qualquer campo que contenha o nome da imagem ou do registry
+- Heurísticas baseadas em nomes similares
+
+A única fonte confiável do repositório GitHub é:
+1. O label `titlis.io/repo` no workload (ex: `kaiqui/titlis-api`)
+2. O que o usuário informar explicitamente nesta conversa
+
+Se o usuário corrigir o repo (`"o correto é kaiqui/titlis-api, não kailima"`), adote
+imediatamente o valor informado pelo usuário e descarte qualquer inferência anterior.
+
+---
+
 Cada serviço pode ter um arquivo `.titlis/service.yaml` na raiz do seu repositório GitHub
 que define os caminhos dos manifests e o nome do serviço no Datadog. Siga este fluxo:
 
 ### Passo 1 — Obter scorecard e labels do workload
 Use `get_deployment_spec(namespace, name)`. O resultado inclui `labels` com campos como:
-- `titlis.io/repo`: owner/nome-do-repo no GitHub (ex: `kailima/titlis-api`)
+- `titlis.io/github-owner`: owner no GitHub (ex: `kaiqui`)
+- `titlis.io/repo`: nome do repositório no GitHub (ex: `titlis-api`)
 - `app.kubernetes.io/name`: nome canônico do serviço
 
+O repositório GitHub completo é: `labels["titlis.io/github-owner"] + "/" + labels["titlis.io/repo"]`
+Exemplo: owner=`kaiqui`, repo=`titlis-api` → `kaiqui/titlis-api`
+
+**Importante:** `titlis.io/repo` contém APENAS o nome do repo (sem o owner). O owner vem de
+`titlis.io/github-owner`. Nunca confunda com a imagem Docker (`kailima/titlis-api`) — são
+namespaces diferentes.
+
 ### Passo 2 — Ler .titlis/service.yaml
-Se `labels["titlis.io/repo"]` estiver presente, chame:
+Se `labels["titlis.io/github-owner"]` e `labels["titlis.io/repo"]` estiverem presentes, chame:
 ```
-get_file_contents(owner=<owner>, repo=<repo>, path=".titlis/service.yaml")
+get_file_contents(owner=<titlis.io/github-owner>, repo=<titlis.io/repo>, path=".titlis/service.yaml")
 ```
 O YAML retornado tem este formato:
 ```yaml
@@ -113,9 +140,30 @@ Quando o usuário pedir métricas ou quiser criar monitors para um workload:
 2. Use as tags `service:<nome>,env:<ambiente>` nas queries de métricas
 3. Para monitors relacionados a SLO, use o nome do SLO do scorecard
 
-Se `titlis.io/repo` não estiver nos labels, pergunte ao usuário apenas o owner e nome do repo
-(ex: `owner/repo`), e nunca peça os caminhos completos dos arquivos — descubra-os via
-`search_code` ou lendo o `.titlis/service.yaml`.
+Se `titlis.io/github-owner` ou `titlis.io/repo` não estiverem nos labels (ou estiverem vazios),
+pergunte ao usuário apenas o repositório GitHub completo (ex: `owner/nome-repo`).
+Nunca peça os caminhos completos dos arquivos — descubra-os via `search_code` ou lendo
+o `.titlis/service.yaml` assim que tiver o repo correto.
+
+## Erros de acesso ao GitHub — Repositório Privado
+
+O GitHub retorna HTTP **404** (não 403) quando o PAT não tem permissão para acessar um repositório
+privado. Isso é intencional para evitar revelar a existência de repos privados a tokens sem acesso.
+
+Consequência: uma tool call que retorna `{"error": "Not Found: ..."}` pode significar tanto
+"o repositório não existe" quanto "o PAT não tem permissão".
+
+**Regra obrigatória:** quando qualquer tool do GitHub retornar erro contendo "Not Found" ou "404"
+para um repositório que você já *conhece* (extraído do label `titlis.io/repo` ou informado pelo
+usuário anteriormente nesta conversa):
+
+1. **NÃO** peça ao usuário para confirmar o nome do repositório — a informação é confiável
+2. **NÃO** pergunte pela branch padrão — não é essa a causa do problema
+3. **Informe diretamente:** "O repositório `<owner/repo>` não está acessível. O GitHub retorna 404
+   para repositórios privados quando o Personal Access Token não tem permissão. Provavelmente o PAT
+   não possui o scope `repo` (necessário para repositórios privados) ou `read:org` (necessário para
+   repos de organizações). Acesse **Configurações → Integrações → GitHub** para atualizar o token."
+4. Não tente adivinhar caminhos nem prosseguir com a remediação até que o usuário corrija as credenciais
 
 Idioma: português brasileiro."""
 
@@ -554,6 +602,16 @@ def _tool_to_openai(tool: Any) -> Dict[str, Any]:
 
 
 def _parse_mcp_result(result: Any) -> Any:
+    # isError=True indica falha na execução da tool — retornamos com chave "error"
+    # para que o LLM interprete corretamente como falha, não como resultado.
+    if getattr(result, "isError", False):
+        content = getattr(result, "content", None)
+        error_text = ""
+        if content:
+            item = content[0]
+            error_text = getattr(item, "text", str(item))
+        return {"error": error_text or "tool_call_failed"}
+
     content = getattr(result, "content", None)
     if not content:
         return {}

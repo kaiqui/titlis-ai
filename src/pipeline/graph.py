@@ -121,11 +121,25 @@ class RemediationGraph:
                     "get_file_contents",
                     {"owner": owner, "repo": name, "path": ".titlis/service.yaml"},
                 )
+                if getattr(result, "isError", False):
+                    content = getattr(result, "content", None)
+                    err_text = getattr(content[0], "text", "") if content else ""
+                    if "not found" in err_text.lower() or "404" in err_text:
+                        logger.warning(
+                            "Repo não acessível — PAT pode não ter scope 'repo' para repo privado",
+                            extra={"repo": f"{owner}/{name}", "error": err_text[:120]},
+                        )
+                    else:
+                        logger.debug(".titlis/service.yaml não existe no repo", extra={"repo": f"{owner}/{name}"})
+                    return None
                 text = _mcp_text(result)
                 if text:
                     return yaml.safe_load(text)
-        except Exception:
-            logger.debug(".titlis/service.yaml não encontrado", extra={"repo_url": repo_url})
+        except Exception as exc:
+            logger.debug(
+                ".titlis/service.yaml não acessível",
+                extra={"repo_url": repo_url, "error": str(exc)[:120]},
+            )
         return None
 
     async def _resolve_manifest_path(self, state: ScorecardRemediationState) -> Dict[str, Any]:
@@ -133,7 +147,15 @@ class RemediationGraph:
         labels = live.get("labels") or {}
         namespace = state.get("namespace", "")
         ai_config = state.get("ai_config", {})
+
+        # repo_url pode vir da request ou ser inferido dos labels do workload
+        # titlis.io/github-owner + titlis.io/repo formam "owner/repo"
         repo_url = state.get("repo_url", "")
+        if not repo_url:
+            gh_owner = labels.get("titlis.io/github-owner", "")
+            gh_repo = labels.get("titlis.io/repo", "")
+            if gh_owner and gh_repo:
+                repo_url = f"https://github.com/{gh_owner}/{gh_repo}"
 
         env = (
             _detect_env_from_namespace(namespace)
@@ -172,8 +194,10 @@ class RemediationGraph:
                 "deployment_name": state.get("deployment_name", ""),
                 "namespace": namespace,
                 "hint": (
-                    "Adicione .titlis/service.yaml ao repo para evitar esta pergunta. "
-                    "Veja a documentação em docs/service-yaml.md."
+                    "Não foi possível ler .titlis/service.yaml automaticamente. "
+                    "Se o repositório for privado, verifique se o PAT tem o scope 'repo' "
+                    "(e 'read:org' para repos de organizações) em Configurações → Integrações. "
+                    "Caso as credenciais estejam corretas, adicione .titlis/service.yaml ao repo."
                 ),
             }
         )

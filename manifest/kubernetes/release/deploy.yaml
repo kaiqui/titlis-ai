@@ -48,6 +48,8 @@ spec:
     metadata:
       labels:
         app: titlis-ai
+        titlis.io/github-owner: kaiqui
+        titlis.io/repo: titlis-ai
         tags.datadoghq.com/env: "preprod"
         tags.datadoghq.com/service: "titlis-ai"
         tags.datadoghq.com/version: "__IMAGE_TAG__"
