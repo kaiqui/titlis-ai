@@ -48,20 +48,6 @@ class SetManifestPathRequest(BaseModel):
     manifest_path: str
 
 
-class PullRequestResult(BaseModel):
-    number: int
-    title: str
-    url: str
-    branch: str
-    base_branch: str
-
-
-class RemediationFile(BaseModel):
-    path: str
-    content: str
-    commit_message: str
-
-
 class SseChunk(BaseModel):
     type: str
     content: Optional[str] = None

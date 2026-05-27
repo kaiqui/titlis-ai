@@ -1,5 +1,7 @@
+import asyncio
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
+import httpx
 import litellm
 
 from src.domain.models import TenantAiConfig
@@ -12,6 +14,16 @@ BUDGET_WARNING_THRESHOLD = 0.80
 _PROVIDER_ALIASES = {
     "google": "gemini",
 }
+
+# Erros transitórios que justificam retry — excluem erros de auth/quota/payload.
+_RETRYABLE_HTTP = (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectTimeout)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, _RETRYABLE_HTTP):
+        return True
+    status = getattr(exc, "status_code", None)
+    return status in (429, 502, 503, 504)
 
 
 def build_litellm_model_id(provider: str, model: str) -> str:
@@ -74,24 +86,40 @@ class LLMService:
     ) -> str:
         self._check_quota(config, tenant_id)
         model_id = build_litellm_model_id(config.provider, config.model)
-        response = await litellm.acompletion(
-            model=model_id,
-            messages=messages,
-            api_key=config.api_key,
-            timeout=60,
-            metadata=self._langfuse_metadata(tenant_id, model_id, trace_metadata),
-        )
-        content: str = response.choices[0].message.content or ""
-        logger.info(
-            "LLM completion concluída",
-            extra={
-                "tenant_id": tenant_id,
-                "model": model_id,
-                "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
-                "completion_tokens": getattr(response.usage, "completion_tokens", 0),
-            },
-        )
-        return content
+        metadata = self._langfuse_metadata(tenant_id, model_id, trace_metadata)
+
+        last_exc: Exception = RuntimeError("nenhuma tentativa executada")
+        for attempt in range(3):
+            try:
+                response = await litellm.acompletion(
+                    model=model_id,
+                    messages=messages,
+                    api_key=config.api_key,
+                    timeout=90,
+                    metadata=metadata,
+                )
+                content: str = response.choices[0].message.content or ""
+                logger.info(
+                    "LLM completion concluída",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "model": model_id,
+                        "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
+                        "completion_tokens": getattr(response.usage, "completion_tokens", 0),
+                    },
+                )
+                return content
+            except Exception as exc:
+                last_exc = exc
+                if not _is_retryable(exc) or attempt == 2:
+                    raise
+                delay = 2.0 ** attempt
+                logger.warning(
+                    "LLM erro transitório, retentando",
+                    extra={"attempt": attempt + 1, "delay": delay, "error": str(exc)},
+                )
+                await asyncio.sleep(delay)
+        raise last_exc
 
     async def chat_stream(
         self,
@@ -102,15 +130,33 @@ class LLMService:
     ) -> AsyncGenerator[str, None]:
         self._check_quota(config, tenant_id)
         model_id = build_litellm_model_id(config.provider, config.model)
-        response = await litellm.acompletion(
-            model=model_id,
-            messages=messages,
-            api_key=config.api_key,
-            stream=True,
-            timeout=60,
-            metadata=self._langfuse_metadata(tenant_id, model_id, trace_metadata),
-        )
-        async for chunk in response:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
+        metadata = self._langfuse_metadata(tenant_id, model_id, trace_metadata)
+
+        last_exc: Exception = RuntimeError("nenhuma tentativa executada")
+        for attempt in range(3):
+            try:
+                response = await litellm.acompletion(
+                    model=model_id,
+                    messages=messages,
+                    api_key=config.api_key,
+                    stream=True,
+                    timeout=120,
+                    metadata=metadata,
+                )
+                # Se chegou aqui, conexão estabelecida — itera o stream
+                async for chunk in response:
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        yield delta
+                return
+            except Exception as exc:
+                last_exc = exc
+                if not _is_retryable(exc) or attempt == 2:
+                    raise
+                delay = 2.0 ** attempt
+                logger.warning(
+                    "LLM stream erro transitório, retentando",
+                    extra={"attempt": attempt + 1, "delay": delay, "error": str(exc)},
+                )
+                await asyncio.sleep(delay)
+        raise last_exc

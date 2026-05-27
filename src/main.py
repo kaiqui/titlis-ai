@@ -64,6 +64,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         },
     )
     yield
+    from src.bootstrap.dependencies import get_datadog_config_client, get_knowledge_client, get_scorecard_client
+
+    await get_scorecard_client().close()
+    await get_knowledge_client().close()
+    await get_datadog_config_client().close()
     logger.info("titlis-ai encerrando")
 
 

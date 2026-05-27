@@ -1,4 +1,6 @@
 import asyncio
+import json
+from datetime import datetime
 from typing import Any, Dict
 
 import yaml
@@ -6,20 +8,44 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from src.infrastructure.github.client import GitHubAPIClient
-from src.infrastructure.github.repository import GitHubRepository
+from src.infrastructure.mcp.github_mcp import github_mcp_session
 from src.infrastructure.titlis_api.scorecard_client import ScorecardClient
 from src.infrastructure.titlis_api.knowledge_client import KnowledgeClient
-from src.domain.models import RemediationFile
 from src.pipeline.state import ScorecardRemediationState
 from src.services.embedding_service import EmbeddingService
 from src.services.llm_service import LLMService
-from src.tools.github_tools import _never_reduce_violated
+from src.tools.github_tools import _never_reduce_violated, _parse_repo
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 _MAX_RETRIES = 3
+
+
+def _github_session_kwargs(ai_config: dict) -> dict:
+    auth_mode = ai_config.get("github_auth_mode", "pat")
+    if auth_mode == "github_app":
+        app_id = ai_config.get("github_app_id")
+        priv_key = ai_config.get("github_app_private_key")
+        install_id = ai_config.get("github_app_installation_id")
+        if app_id and priv_key and install_id:
+            return {
+                "github_app_id": app_id,
+                "github_app_private_key": priv_key,
+                "github_app_installation_id": install_id,
+            }
+    token = ai_config.get("github_token")
+    if token:
+        return {"github_token": token}
+    return {}
+
+
+def _mcp_text(result) -> str:
+    if result and result.content:
+        item = result.content[0]
+        if hasattr(item, "text"):
+            return item.text
+    return ""
 
 
 def _detect_env_from_cluster(cluster_name: str) -> str:
@@ -33,6 +59,17 @@ def _detect_env_from_cluster(cluster_name: str) -> str:
     for kw in ("dev", "development"):
         if kw in name:
             return "dev"
+    return ""
+
+
+def _detect_env_from_namespace(namespace: str) -> str:
+    ns = namespace.lower()
+    if any(kw in ns for kw in ("prod", "production")):
+        return "prd"
+    if any(kw in ns for kw in ("hml", "homolog", "staging", "stg")):
+        return "hml"
+    if any(kw in ns for kw in ("dev", "develop")):
+        return "dev"
     return ""
 
 
@@ -73,25 +110,71 @@ class RemediationGraph:
             "live_deployment": scorecard,
         }
 
+    async def _read_service_yaml(self, repo_url: str, ai_config: dict) -> Dict[str, Any] | None:
+        kwargs = _github_session_kwargs(ai_config)
+        if not kwargs:
+            return None
+        try:
+            owner, name = _parse_repo(repo_url)
+            async with github_mcp_session(**kwargs) as session:
+                result = await session.call_tool(
+                    "get_file_contents",
+                    {"owner": owner, "repo": name, "path": ".titlis/service.yaml"},
+                )
+                text = _mcp_text(result)
+                if text:
+                    return yaml.safe_load(text)
+        except Exception:
+            logger.debug(".titlis/service.yaml não encontrado", extra={"repo_url": repo_url})
+        return None
+
     async def _resolve_manifest_path(self, state: ScorecardRemediationState) -> Dict[str, Any]:
         live = state.get("live_deployment") or {}
         labels = live.get("labels") or {}
+        namespace = state.get("namespace", "")
+        ai_config = state.get("ai_config", {})
+        repo_url = state.get("repo_url", "")
 
         env = (
-            labels.get("env")
+            _detect_env_from_namespace(namespace)
+            or labels.get("env")
             or labels.get("environment")
             or live.get("environment")
             or _detect_env_from_cluster(live.get("cluster", ""))
             or "unknown"
         )
 
+        # Tenta ler .titlis/service.yaml automaticamente
+        if repo_url:
+            svc = await self._read_service_yaml(repo_url, ai_config)
+            if svc:
+                gitops_paths = svc.get("spec", {}).get("gitops", {}).get("paths", {})
+                path_cfg = gitops_paths.get(env) or gitops_paths.get(next(iter(gitops_paths), ""), {})
+                if path_cfg and path_cfg.get("path"):
+                    logger.info(
+                        ".titlis/service.yaml resolveu caminho do manifest",
+                        extra={"env": env, "path": path_cfg["path"]},
+                    )
+                    return {
+                        "deploy_manifest_path": path_cfg["path"],
+                        "effective_base_branch": path_cfg.get("base_branch")
+                        or ai_config.get("github_base_branch", "main"),
+                        "detected_environment": env,
+                        "service_definition": svc,
+                    }
+
+        # Fallback: pede confirmação ao usuário
         confirmed_path = interrupt(
             {
                 "type": "manifest_path_required",
                 "detected_environment": env,
                 "suggested_path": state.get("deploy_manifest_path", ""),
                 "deployment_name": state.get("deployment_name", ""),
-                "namespace": state.get("namespace", ""),
+                "namespace": namespace,
+                "hint": (
+                    "Adicione .titlis/service.yaml ao repo para evitar esta pergunta. "
+                    "Veja a documentação em docs/service-yaml.md."
+                ),
             }
         )
 
@@ -105,11 +188,10 @@ class RemediationGraph:
         findings = state.get("findings", [])
         repo_url = state.get("repo_url", "")
         path = state.get("deploy_manifest_path", "")
-        base_branch = ai_config.get("github_base_branch", "main")
-        github_token = ai_config.get("github_token")
+        base_branch = state.get("effective_base_branch") or ai_config.get("github_base_branch", "main")
 
         rag_task = self._fetch_rag_context(findings, ai_config)
-        manifest_task = self._fetch_manifest(repo_url, base_branch, path, github_token)
+        manifest_task = self._fetch_manifest(repo_url, base_branch, path, ai_config)
 
         rag_chunks, current_manifest = await asyncio.gather(rag_task, manifest_task)
 
@@ -133,46 +215,56 @@ class RemediationGraph:
             logger.warning("RAG falhou no pipeline de remediação")
             return []
 
-    async def _fetch_manifest(self, repo_url, branch, path, token):
-        if not token or not repo_url:
+    async def _fetch_manifest(self, repo_url, branch, path, ai_config):
+        kwargs = _github_session_kwargs(ai_config)
+        if not kwargs or not repo_url:
             return None
         try:
-            clean = repo_url.rstrip("/").removeprefix("https://github.com/").removeprefix("http://github.com/")
-            parts = clean.split("/", 1)
-            if len(parts) != 2:
-                return None
-            owner, name = parts
-            client = GitHubAPIClient(token=token)
-            repo = GitHubRepository(client=client)
-            return await repo.get_file_content(owner, name, path, branch)
+            owner, name = _parse_repo(repo_url)
+            async with github_mcp_session(**kwargs) as session:
+                result = await session.call_tool(
+                    "get_file_contents", {"owner": owner, "repo": name, "path": path, "ref": branch}
+                )
+                return _mcp_text(result) or None
         except Exception:
-            logger.warning("Falha ao ler manifest do GitHub", extra={"path": path})
+            logger.warning("Falha ao ler manifest via MCP GitHub", extra={"path": path})
             return None
 
     async def _check_existing_pr(self, state: ScorecardRemediationState) -> Dict[str, Any]:
         ai_config = state.get("ai_config", {})
-        github_token = ai_config.get("github_token")
+        kwargs = _github_session_kwargs(ai_config)
         repo_url = state.get("repo_url", "")
         namespace = state.get("namespace", "")
         deployment_name = state.get("deployment_name", "")
         base_branch = ai_config.get("github_base_branch", "main")
 
-        if not github_token or not repo_url:
+        if not kwargs or not repo_url:
             return {"existing_pr": None}
 
+        safe_name = deployment_name.replace("/", "-")
+        branch_prefix = f"fix/auto-remediation-{namespace}-{safe_name}-"
+
         try:
-            clean = repo_url.rstrip("/").removeprefix("https://github.com/").removeprefix("http://github.com/")
-            parts = clean.split("/", 1)
-            if len(parts) != 2:
-                return {"existing_pr": None}
-            owner, name = parts
-            client = GitHubAPIClient(token=github_token)
-            repo = GitHubRepository(client=client)
-            pr = await repo.find_open_remediation_pr(owner, name, namespace, deployment_name, base_branch)
-            if pr:
-                return {"existing_pr": {"pr_url": pr.url, "pr_number": pr.number, "branch": pr.branch}}
+            owner, name = _parse_repo(repo_url)
+            async with github_mcp_session(**kwargs) as session:
+                result = await session.call_tool(
+                    "list_pull_requests",
+                    {"owner": owner, "repo": name, "state": "open", "base": base_branch},
+                )
+                prs = json.loads(_mcp_text(result) or "[]")
+                for pr in prs:
+                    head_ref = pr.get("head", {}).get("ref", "")
+                    if head_ref.startswith(branch_prefix):
+                        return {
+                            "existing_pr": {
+                                "pr_url": pr["html_url"],
+                                "pr_number": pr["number"],
+                                "branch": head_ref,
+                            }
+                        }
         except Exception:
-            logger.warning("Falha ao verificar PR existente")
+            logger.warning("Falha ao verificar PR existente via MCP GitHub")
+
         return {"existing_pr": None}
 
     async def _analyze_findings(self, state: ScorecardRemediationState) -> Dict[str, Any]:
@@ -269,14 +361,12 @@ class RemediationGraph:
         current = state.get("current_manifest", "")
         errors = []
 
-        # YAML syntax check
         try:
             yaml.safe_load(patched)
         except yaml.YAMLError as exc:
             errors.append(f"YAML inválido: {exc}")
             return {"validation_errors": errors}
 
-        # never-reduce check on resource values
         if current:
             current_lines = {
                 line.strip().split(":")[0]: line.split(":", 1)[-1].strip().strip('"').strip("'")
@@ -309,8 +399,8 @@ class RemediationGraph:
 
     async def _create_remediation_pr(self, state: ScorecardRemediationState) -> Dict[str, Any]:
         ai_config = state.get("ai_config", {})
-        github_token = ai_config.get("github_token", "")
-        base_branch = ai_config.get("github_base_branch", "main")
+        kwargs = _github_session_kwargs(ai_config)
+        base_branch = state.get("effective_base_branch") or ai_config.get("github_base_branch", "main")
         repo_url = state.get("repo_url", "")
         path = state.get("deploy_manifest_path", "deploy.yaml")
         patched = state.get("patched_manifest", "")
@@ -318,43 +408,54 @@ class RemediationGraph:
         namespace = state.get("namespace", "")
         deployment_name = state.get("deployment_name", "")
 
-        clean = repo_url.rstrip("/").removeprefix("https://github.com/").removeprefix("http://github.com/")
-        parts = clean.split("/", 1)
-        owner, name = parts[0], parts[1]
-
-        from datetime import datetime
-
+        owner, name = _parse_repo(repo_url)
         ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         branch_name = f"fix/auto-remediation-{namespace}-{deployment_name}-{ts}"
-
-        client = GitHubAPIClient(token=github_token)
-        repo = GitHubRepository(client=client)
-
-        exists = await repo.branch_exists(owner, name, branch_name)
-        if not exists:
-            await repo.create_branch(owner, name, branch_name, base_branch)
-
         commit_msg = f"fix(titlis-ai): auto-remediation {deployment_name} [{', '.join(findings)}]"
-        files = [RemediationFile(path=path, content=patched, commit_message=commit_msg)]
-        await repo.commit_files(owner, name, branch_name, files)
-
-        findings_str = "\n".join(f"- {f}" for f in findings)
         pr_body = (
             f"## Remediação automática — {deployment_name}\n\n"
             f"**Namespace:** {namespace}\n\n"
-            f"**Findings corrigidos:**\n{findings_str}\n\n"
-            f"*Gerado pelo Titlis AI Assistant*"
-        )
-        pr = await repo.create_pull_request(
-            repo_owner=owner,
-            repo_name=name,
-            branch_name=branch_name,
-            base_branch=base_branch,
-            title=f"fix(titlis): auto-remediation {deployment_name} [{', '.join(findings[:3])}]",
-            body=pr_body,
+            f"**Findings corrigidos:**\n"
+            + "\n".join(f"- {f}" for f in findings)
+            + "\n\n*Gerado pelo Titlis AI Assistant*"
         )
 
-        return {"pr_result": {"pr_url": pr.url, "pr_number": pr.number, "branch": pr.branch}}
+        async with github_mcp_session(**kwargs) as session:
+            await session.call_tool(
+                "create_branch",
+                {"owner": owner, "repo": name, "branch": branch_name, "from_branch": base_branch},
+            )
+            await session.call_tool(
+                "push_files",
+                {
+                    "owner": owner,
+                    "repo": name,
+                    "branch": branch_name,
+                    "message": commit_msg,
+                    "files": [{"path": path, "content": patched}],
+                },
+            )
+            result = await session.call_tool(
+                "create_pull_request",
+                {
+                    "owner": owner,
+                    "repo": name,
+                    "title": f"fix(titlis): auto-remediation {deployment_name} [{', '.join(findings[:3])}]",
+                    "body": pr_body,
+                    "head": branch_name,
+                    "base": base_branch,
+                    "draft": False,
+                },
+            )
+
+        pr_data = json.loads(_mcp_text(result) or "{}")
+        return {
+            "pr_result": {
+                "pr_url": pr_data.get("html_url", ""),
+                "pr_number": pr_data.get("number", 0),
+                "branch": branch_name,
+            }
+        }
 
     async def _notify_api(self, state: ScorecardRemediationState) -> Dict[str, Any]:
         pr = state.get("pr_result", {}) or {}

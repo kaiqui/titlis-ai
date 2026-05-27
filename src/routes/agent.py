@@ -5,6 +5,7 @@ from src.bootstrap.dependencies import get_agent_service, get_session_store
 from src.domain.models import AgentChatRequest, AgentToolsRespondRequest
 from src.settings import settings
 from src.utils.logger import get_logger
+from src.utils.resilience import keepalive_stream
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -26,7 +27,7 @@ async def agent_chat(body: AgentChatRequest, request: Request) -> StreamingRespo
     session = store.get_or_create(body.session_id, body.tenant_id, body.ai_config.model_dump())
     store.cleanup_expired()
 
-    async def generate():
+    async def _inner():
         try:
             async for chunk in service.run_turn(session, body.message):
                 yield chunk
@@ -36,6 +37,13 @@ async def agent_chat(body: AgentChatRequest, request: Request) -> StreamingRespo
             logger.exception("Erro no agente", extra={"session_id": body.session_id})
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    async def generate():
+        async for chunk in keepalive_stream(_inner()):
+            if await request.is_disconnected():
+                logger.info("Cliente desconectou", extra={"session_id": body.session_id})
+                break
+            yield chunk
 
     return StreamingResponse(
         generate(),
@@ -59,7 +67,7 @@ async def agent_tools_respond(
 
     service = get_agent_service()
 
-    async def generate():
+    async def _inner():
         try:
             async for chunk in service.run_tool_responses(session, body.decisions):
                 yield chunk
@@ -69,6 +77,13 @@ async def agent_tools_respond(
             logger.exception("Erro ao responder tools", extra={"session_id": session_id})
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    async def generate():
+        async for chunk in keepalive_stream(_inner()):
+            if await request.is_disconnected():
+                logger.info("Cliente desconectou (tools/respond)", extra={"session_id": session_id})
+                break
+            yield chunk
 
     return StreamingResponse(
         generate(),

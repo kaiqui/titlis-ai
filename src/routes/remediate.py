@@ -18,6 +18,7 @@ from src.observability.metrics import (
 )
 from src.settings import settings
 from src.utils.logger import get_logger
+from src.utils.resilience import keepalive_stream
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -67,7 +68,7 @@ async def remediate(body: RemediateRequest, request: Request) -> StreamingRespon
         "validation_errors": [],
     }
 
-    async def generate() -> AsyncGenerator[str, None]:
+    async def _inner() -> AsyncGenerator[str, None]:
         start = time.monotonic()
         status = "success"
         try:
@@ -140,6 +141,16 @@ async def remediate(body: RemediateRequest, request: Request) -> StreamingRespon
                 phase="remediate",
             ).observe(elapsed)
 
+    async def generate() -> AsyncGenerator[str, None]:
+        async for chunk in keepalive_stream(_inner()):
+            if await request.is_disconnected():
+                logger.info(
+                    "Cliente desconectou durante remediação",
+                    extra={"tenant_id": body.tenant_id, "workload_id": body.workload_id},
+                )
+                break
+            yield chunk
+
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
@@ -159,7 +170,7 @@ async def confirm_remediation(
     # Reconstrói config sem callbacks — thread já está no checkpointer
     config: dict = {"configurable": {"thread_id": thread_id}}
 
-    async def generate() -> AsyncGenerator[str, None]:
+    async def _inner() -> AsyncGenerator[str, None]:
         try:
             async for event in graph.compiled.astream(Command(resume=body.approved), config, stream_mode="updates"):
                 for node_name, node_output in event.items():
@@ -176,7 +187,6 @@ async def confirm_remediation(
                                     "branch": pr.get("branch"),
                                 }
                             )
-                            # Metrics: PR criado — pillar desconhecido neste ponto
                             ai_pr_created_total.labels(
                                 tenant_id=str(body.approved),
                                 pillar="unknown",
@@ -194,6 +204,13 @@ async def confirm_remediation(
             logger.exception("Erro ao confirmar remediação", extra={"thread_id": thread_id})
             yield _sse({"type": "error", "error": str(exc)})
             yield _sse({"type": "done"})
+
+    async def generate() -> AsyncGenerator[str, None]:
+        async for chunk in keepalive_stream(_inner()):
+            if await request.is_disconnected():
+                logger.info("Cliente desconectou durante confirmação", extra={"thread_id": thread_id})
+                break
+            yield chunk
 
     return StreamingResponse(
         generate(),
@@ -213,7 +230,7 @@ async def set_manifest_path(
     graph = get_remediation_graph()
     config: dict = {"configurable": {"thread_id": thread_id}}
 
-    async def generate() -> AsyncGenerator[str, None]:
+    async def _inner() -> AsyncGenerator[str, None]:
         try:
             async for event in graph.compiled.astream(
                 Command(resume=body.manifest_path), config, stream_mode="updates"
@@ -253,6 +270,13 @@ async def set_manifest_path(
             logger.exception("Erro ao definir path do manifest", extra={"thread_id": thread_id})
             yield _sse({"type": "error", "error": str(exc)})
             yield _sse({"type": "done"})
+
+    async def generate() -> AsyncGenerator[str, None]:
+        async for chunk in keepalive_stream(_inner()):
+            if await request.is_disconnected():
+                logger.info("Cliente desconectou (set-path)", extra={"thread_id": thread_id})
+                break
+            yield chunk
 
     return StreamingResponse(
         generate(),

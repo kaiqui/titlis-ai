@@ -1,3 +1,4 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional
@@ -5,11 +6,9 @@ from typing import AsyncIterator, Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+_INIT_TIMEOUT = 30.0
 
-# Conecta ao github-mcp-server via stdio.
-# Suporta dois modos:
-#   PAT: GITHUB_TOKEN passado via github_token
-#   GitHub App: GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY + GITHUB_APP_INSTALLATION_ID
+
 @asynccontextmanager
 async def github_mcp_session(
     github_token: Optional[str] = None,
@@ -39,5 +38,5 @@ async def github_mcp_session(
     )
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
-            await session.initialize()
+            await asyncio.wait_for(session.initialize(), timeout=_INIT_TIMEOUT)
             yield session

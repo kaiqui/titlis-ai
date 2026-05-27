@@ -8,11 +8,20 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+_POOL = httpx.Limits(max_connections=10, max_keepalive_connections=5, keepalive_expiry=30)
+
 
 class KnowledgeClient:
     def __init__(self) -> None:
-        self._base = settings.titlis_api_url
-        self._secret = settings.internal_secret
+        self._client = httpx.AsyncClient(
+            base_url=settings.titlis_api_url,
+            headers={"X-Internal-Secret": settings.internal_secret},
+            timeout=30.0,
+            limits=_POOL,
+        )
+
+    async def close(self) -> None:
+        await self._client.aclose()
 
     async def index_chunk(
         self,
@@ -31,15 +40,9 @@ class KnowledgeClient:
             "embedding": embedding,
             "metadata": json.dumps(metadata) if metadata else None,
         }
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{self._base}/v1/internal/rag/chunks",
-                json=payload,
-                headers={"X-Internal-Secret": self._secret},
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            return resp.json()["id"]
+        resp = await self._client.post("/v1/internal/rag/chunks", json=payload)
+        resp.raise_for_status()
+        return resp.json()["id"]
 
     async def search_similar(
         self,
@@ -47,13 +50,10 @@ class KnowledgeClient:
         embedding: List[float],
         limit: int = 5,
     ) -> List[dict]:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{self._base}/v1/internal/rag/search",
-                json={"tenantId": tenant_id, "embedding": embedding, "limit": limit},
-                headers={"X-Internal-Secret": self._secret},
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            result: List[dict] = resp.json()
-            return result
+        resp = await self._client.post(
+            "/v1/internal/rag/search",
+            json={"tenantId": tenant_id, "embedding": embedding, "limit": limit},
+        )
+        resp.raise_for_status()
+        result: List[dict] = resp.json()
+        return result

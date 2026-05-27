@@ -19,6 +19,7 @@ from src.services.llm_service import LLMService, QuotaExceededError
 from src.services.prompt_builder import PromptBuilder
 from src.settings import settings
 from src.utils.logger import get_logger
+from src.utils.resilience import keepalive_stream
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -80,7 +81,7 @@ async def explain_finding(
     model_label = body.ai_config.model
     rule_label = body.finding.rule_id
 
-    async def generate() -> AsyncGenerator[str, None]:
+    async def _inner() -> AsyncGenerator[str, None]:
         start = time.monotonic()
         status = "success"
         try:
@@ -121,6 +122,16 @@ async def explain_finding(
                 model=model_label,
                 phase="explain",
             ).observe(elapsed)
+
+    async def generate() -> AsyncGenerator[str, None]:
+        async for chunk in keepalive_stream(_inner()):
+            if await request.is_disconnected():
+                logger.info(
+                    "Cliente desconectou durante explain",
+                    extra={"tenant_id": body.tenant_id, "rule_id": body.finding.rule_id},
+                )
+                break
+            yield chunk
 
     return StreamingResponse(
         generate(),

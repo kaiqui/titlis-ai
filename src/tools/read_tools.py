@@ -26,9 +26,47 @@ def build_read_tools(scorecard_client: ScorecardClient, tenant_id: int) -> ToolR
             return {"error": "workload_not_found", "workload_id": workload_id}
         return result
 
+    _HPA_RULE_IDS = {"RES-007", "RES-008", "RES-016", "PERF-003"}
+
     async def get_hpa_config(namespace: str, name: str) -> Dict[str, Any]:
-        # HPA data is not currently stored in titlis-api; returns null to signal no HPA configured.
-        return {"namespace": namespace, "name": name, "hpa": None}
+        # HPA config completo não é armazenado no banco — apenas os findings do scoreops.
+        # Extrai o que o scorecard sabe sobre o HPA e orienta o LLM a buscar o manifest no GitHub.
+        try:
+            scorecard = await scorecard_client.get_scorecard_by_name(tenant_id, name, namespace)
+            if scorecard:
+                hpa_findings = {
+                    r["rule_id"]: {
+                        "passed": r.get("passed"),
+                        "actual": r.get("actual_value"),
+                        "expected": r.get("expected_value"),
+                        "message": r.get("message"),
+                    }
+                    for r in scorecard.get("validation_results", [])
+                    if r.get("rule_id") in _HPA_RULE_IDS
+                }
+                return {
+                    "namespace": namespace,
+                    "name": name,
+                    "hpa": None,
+                    "hpa_findings": hpa_findings,
+                    "hint": (
+                        "A configuração completa do HPA não está no banco de dados. "
+                        "Use a tool 'search_code' do GitHub MCP para localizar o arquivo HPA "
+                        "(busque por 'HorizontalPodAutoscaler' ou 'kind: HPA' no repositório) "
+                        "e 'get_file_contents' para lê-lo antes de sugerir mudanças."
+                    ),
+                }
+        except Exception:
+            logger.warning("Falha ao buscar findings HPA do scorecard", extra={"namespace": namespace, "name": name})
+        return {
+            "namespace": namespace,
+            "name": name,
+            "hpa": None,
+            "hint": (
+                "HPA não encontrado no banco. Use 'search_code' no GitHub MCP "
+                "para localizar o manifesto HPA no repositório."
+            ),
+        }
 
     async def get_similar_resolved(rule_id: str, pillar: str) -> List[Dict[str, Any]]:
         return await scorecard_client.get_similar_resolved(tenant_id, rule_id)
@@ -90,7 +128,11 @@ def build_read_tools(scorecard_client: ScorecardClient, tenant_id: int) -> ToolR
     registry.register(
         ToolDefinition(
             name="get_hpa_config",
-            description="Retorna configuração de HPA do Deployment, ou null se não configurado.",
+            description=(
+                "Retorna findings de HPA do scorecard (RES-007/008/016, PERF-003) e uma dica de onde "
+                "localizar o manifest HPA no GitHub. O campo 'hpa' sempre é null (não armazenado no DB); "
+                "use 'search_code' do GitHub MCP para ler o HPA YAML antes de propor mudanças."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
