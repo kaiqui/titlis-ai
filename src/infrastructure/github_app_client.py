@@ -1,27 +1,31 @@
+import base64
+import json
 import time
 from typing import Optional
 
 import httpx
-import jwt
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 _GITHUB_API = "https://api.github.com"
-_JWT_EXPIRY_SECONDS = 600
-_JWT_CLOCK_DRIFT_SECONDS = 60
 _HTTP_TIMEOUT = 10.0
 
 
 def _generate_app_jwt(app_id: str, private_key_pem: str) -> str:
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()).rstrip(b"=")
     now = int(time.time())
-    payload = {
-        "iss": app_id,
-        "iat": now - _JWT_CLOCK_DRIFT_SECONDS,
-        "exp": now + _JWT_EXPIRY_SECONDS,
-    }
-    return jwt.encode(payload, private_key_pem, algorithm="RS256")
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"iss": app_id, "iat": now - 60, "exp": now + 600}).encode()
+    ).rstrip(b"=")
+    signing_input = header + b"." + payload
+    private_key = serialization.load_pem_private_key(private_key_pem.encode(), password=None)
+    signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    sig = base64.urlsafe_b64encode(signature).rstrip(b"=")
+    return (signing_input + b"." + sig).decode()
 
 
 async def resolve_installation_id(app_id: str, private_key_pem: str) -> Optional[str]:
@@ -48,7 +52,10 @@ async def resolve_installation_id(app_id: str, private_key_pem: str) -> Optional
             )
 
         installation_id = str(installations[0]["id"])
-        logger.info("Installation ID descoberto automaticamente", extra={"app_id": app_id, "installation_id": installation_id})
+        logger.info(
+            "Installation ID descoberto automaticamente",
+            extra={"app_id": app_id, "installation_id": installation_id},
+        )
         return installation_id
 
     except Exception:

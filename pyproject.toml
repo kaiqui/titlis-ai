@@ -18,7 +18,7 @@ langfuse = "^2.0.0"
 prometheus-client = "^0.21.0"
 ddtrace = "3.17.2"
 mcp = "^1.9"
-PyJWT = {extras = ["cryptography"], version = "^2.9"}
+cryptography = ">=3.4"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"
