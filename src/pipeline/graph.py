@@ -8,6 +8,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
+from src.infrastructure.github_app_client import resolve_installation_id
 from src.infrastructure.mcp.github_mcp import github_mcp_session
 from src.infrastructure.titlis_api.scorecard_client import ScorecardClient
 from src.infrastructure.titlis_api.knowledge_client import KnowledgeClient
@@ -22,18 +23,19 @@ logger = get_logger(__name__)
 _MAX_RETRIES = 3
 
 
-def _github_session_kwargs(ai_config: dict) -> dict:
+async def _github_session_kwargs(ai_config: dict) -> dict:
     auth_mode = ai_config.get("github_auth_mode", "pat")
     if auth_mode == "github_app":
         app_id = ai_config.get("github_app_id")
         priv_key = ai_config.get("github_app_private_key")
-        install_id = ai_config.get("github_app_installation_id")
-        if app_id and priv_key and install_id:
-            return {
-                "github_app_id": app_id,
-                "github_app_private_key": priv_key,
-                "github_app_installation_id": install_id,
-            }
+        if app_id and priv_key:
+            install_id = ai_config.get("github_app_installation_id") or await resolve_installation_id(app_id, priv_key)
+            if install_id:
+                return {
+                    "github_app_id": app_id,
+                    "github_app_private_key": priv_key,
+                    "github_app_installation_id": install_id,
+                }
     token = ai_config.get("github_token")
     if token:
         return {"github_token": token}
@@ -111,7 +113,7 @@ class RemediationGraph:
         }
 
     async def _read_service_yaml(self, repo_url: str, ai_config: dict) -> Dict[str, Any] | None:
-        kwargs = _github_session_kwargs(ai_config)
+        kwargs = await _github_session_kwargs(ai_config)
         if not kwargs:
             return None
         try:
@@ -240,7 +242,7 @@ class RemediationGraph:
             return []
 
     async def _fetch_manifest(self, repo_url, branch, path, ai_config):
-        kwargs = _github_session_kwargs(ai_config)
+        kwargs = await _github_session_kwargs(ai_config)
         if not kwargs or not repo_url:
             return None
         try:
@@ -256,7 +258,7 @@ class RemediationGraph:
 
     async def _check_existing_pr(self, state: ScorecardRemediationState) -> Dict[str, Any]:
         ai_config = state.get("ai_config", {})
-        kwargs = _github_session_kwargs(ai_config)
+        kwargs = await _github_session_kwargs(ai_config)
         repo_url = state.get("repo_url", "")
         namespace = state.get("namespace", "")
         deployment_name = state.get("deployment_name", "")
@@ -423,7 +425,7 @@ class RemediationGraph:
 
     async def _create_remediation_pr(self, state: ScorecardRemediationState) -> Dict[str, Any]:
         ai_config = state.get("ai_config", {})
-        kwargs = _github_session_kwargs(ai_config)
+        kwargs = await _github_session_kwargs(ai_config)
         base_branch = state.get("effective_base_branch") or ai_config.get("github_base_branch", "main")
         repo_url = state.get("repo_url", "")
         path = state.get("deploy_manifest_path", "deploy.yaml")

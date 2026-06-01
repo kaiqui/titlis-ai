@@ -6,6 +6,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 import litellm
 
 from src.domain.models import AgentToolDecision, TenantAiConfig, ToolProposal
+from src.infrastructure.github_app_client import resolve_installation_id
 from src.infrastructure.mcp.datadog_mcp import datadog_mcp_session
 from src.infrastructure.mcp.github_mcp import github_mcp_session
 from src.infrastructure.titlis_api.datadog_config_client import DatadogConfigClient
@@ -242,22 +243,26 @@ class AgentService:
         github_app_private_key = ai_cfg.get("github_app_private_key")
         github_app_installation_id = ai_cfg.get("github_app_installation_id")
 
-        if github_auth_mode == "github_app" and github_app_id and github_app_private_key and github_app_installation_id:
-            try:
-                github_session = await stack.enter_async_context(
-                    github_mcp_session(
-                        github_app_id=github_app_id,
-                        github_app_private_key=github_app_private_key,
-                        github_app_installation_id=github_app_installation_id,
+        if github_auth_mode == "github_app" and github_app_id and github_app_private_key:
+            resolved_installation_id = github_app_installation_id or await resolve_installation_id(github_app_id, github_app_private_key)
+            if resolved_installation_id:
+                try:
+                    github_session = await stack.enter_async_context(
+                        github_mcp_session(
+                            github_app_id=github_app_id,
+                            github_app_private_key=github_app_private_key,
+                            github_app_installation_id=resolved_installation_id,
+                        )
                     )
-                )
-                tool_list = await github_session.list_tools()
-                for tool in tool_list.tools:
-                    github_tool_names.add(tool.name)
-                    github_mcp_tools.append(_tool_to_openai(tool))
-                logger.info("GitHub App MCP iniciado", extra={"tenant_id": tenant_id, "tool_count": len(github_tool_names)})
-            except Exception:
-                logger.exception("GitHub App MCP init falhou — sem tools GitHub neste turno")
+                    tool_list = await github_session.list_tools()
+                    for tool in tool_list.tools:
+                        github_tool_names.add(tool.name)
+                        github_mcp_tools.append(_tool_to_openai(tool))
+                    logger.info("GitHub App MCP iniciado", extra={"tenant_id": tenant_id, "tool_count": len(github_tool_names)})
+                except Exception:
+                    logger.exception("GitHub App MCP init falhou — sem tools GitHub neste turno")
+            else:
+                logger.warning("GitHub App MCP ignorado — installation_id não encontrado", extra={"tenant_id": tenant_id})
         elif github_token:
             try:
                 github_session = await stack.enter_async_context(github_mcp_session(github_token=github_token))
