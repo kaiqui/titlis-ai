@@ -1,5 +1,6 @@
+import json
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.pipeline.graph import RemediationGraph
 
@@ -170,9 +171,9 @@ class TestRouting:
 
 class TestNotifyApi:
     @pytest.mark.asyncio
-    async def test_sends_udp_event(self):
-        udp = AsyncMock()
-        g = _build_graph(udp_client=udp)
+    async def test_sends_remediation_started(self):
+        scorecard = AsyncMock()
+        g = _build_graph(scorecard_client=scorecard)
         state = {
             "tenant_id": 1,
             "workload_id": "uid-abc",
@@ -180,6 +181,211 @@ class TestNotifyApi:
             "pr_result": {"pr_url": "https://github.com/org/repo/pull/42", "pr_number": 42, "branch": "fix/..."},
         }
         await g._notify_api(state)
-        udp.send.assert_called_once()
-        call_kwargs = udp.send.call_args
-        assert call_kwargs[1]["event_type"] == "remediation_started" or call_kwargs[0][0] == "remediation_started"
+        scorecard.notify_remediation_started.assert_called_once()
+        call_kwargs = scorecard.notify_remediation_started.call_args
+        assert call_kwargs.kwargs.get("tenant_id") == 1
+        assert call_kwargs.kwargs.get("workload_id") == "uid-abc"
+
+
+# ── _analyze_findings ─────────────────────────────────────────────────────────
+
+
+class TestAnalyzeFindings:
+    @pytest.mark.asyncio
+    async def test_calls_llm_and_returns_analysis(self):
+        g = _build_graph()
+        g._llm.chat = AsyncMock(return_value="Adicione cpu limits ao container.")
+        state = {
+            "ai_config": {"provider": "openai", "model": "gpt-4o", "api_key": "sk-test"},
+            "findings": [{"rule_id": "RES-003", "message": "No cpu limit", "actual_value": None}],
+            "current_manifest": "apiVersion: apps/v1\n",
+            "deployment_name": "payment-api",
+            "namespace": "production",
+            "rag_context": [],
+            "tenant_id": 1,
+        }
+        result = await g._analyze_findings(state)
+        assert "analysis" in result
+        assert result["analysis"] == "Adicione cpu limits ao container."
+        g._llm.chat.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_injects_rag_context_into_prompt(self):
+        g = _build_graph()
+        g._llm.chat = AsyncMock(return_value="fix it")
+        state = {
+            "ai_config": {"provider": "openai", "model": "gpt-4o", "api_key": "sk-test"},
+            "findings": [{"rule_id": "RES-003", "message": "No cpu", "actual_value": None}],
+            "current_manifest": "",
+            "deployment_name": "api",
+            "namespace": "prod",
+            "rag_context": [{"chunkText": "Use requests.cpu: 100m"}],
+            "tenant_id": 1,
+        }
+        await g._analyze_findings(state)
+        call_messages = g._llm.chat.call_args[0][0]
+        user_content = call_messages[1]["content"]
+        assert "Use requests.cpu: 100m" in user_content
+
+
+# ── _generate_yaml_patch ──────────────────────────────────────────────────────
+
+
+class TestGenerateYamlPatch:
+    @pytest.mark.asyncio
+    async def test_returns_patched_yaml(self):
+        g = _build_graph()
+        g._llm.chat = AsyncMock(return_value="apiVersion: apps/v1\nkind: Deployment\n")
+        state = {
+            "ai_config": {"provider": "openai", "model": "gpt-4o", "api_key": "sk-test"},
+            "analysis": "Adicione cpu limits.",
+            "current_manifest": "apiVersion: apps/v1\n",
+            "findings": [{"rule_id": "RES-003", "message": "No cpu", "actual_value": None}],
+            "retry_count": 0,
+            "validation_errors": [],
+            "tenant_id": 1,
+        }
+        result = await g._generate_yaml_patch(state)
+        assert result["patched_manifest"] == "apiVersion: apps/v1\nkind: Deployment"
+        assert result["retry_count"] == 1
+        assert result["validation_errors"] == []
+
+    @pytest.mark.asyncio
+    async def test_strips_markdown_fences(self):
+        g = _build_graph()
+        g._llm.chat = AsyncMock(return_value="```yaml\napiVersion: apps/v1\n```")
+        state = {
+            "ai_config": {"provider": "openai", "model": "gpt-4o", "api_key": "sk-test"},
+            "analysis": "fix",
+            "current_manifest": "",
+            "findings": [],
+            "retry_count": 0,
+            "validation_errors": [],
+            "tenant_id": 1,
+        }
+        result = await g._generate_yaml_patch(state)
+        assert "```" not in result["patched_manifest"]
+        assert "apiVersion" in result["patched_manifest"]
+
+    @pytest.mark.asyncio
+    async def test_includes_error_feedback_on_retry(self):
+        g = _build_graph()
+        g._llm.chat = AsyncMock(return_value="apiVersion: apps/v1\n")
+        state = {
+            "ai_config": {"provider": "openai", "model": "gpt-4o", "api_key": "sk-test"},
+            "analysis": "fix",
+            "current_manifest": "",
+            "findings": [],
+            "retry_count": 1,
+            "validation_errors": ["YAML inválido: scan error"],
+            "tenant_id": 1,
+        }
+        await g._generate_yaml_patch(state)
+        call_messages = g._llm.chat.call_args[0][0]
+        user_content = call_messages[1]["content"]
+        assert "YAML inválido" in user_content
+
+
+# ── _check_existing_pr ────────────────────────────────────────────────────────
+
+
+class TestCheckExistingPr:
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_github_config(self):
+        g = _build_graph()
+        state = {
+            "ai_config": {},
+            "repo_url": "",
+            "namespace": "production",
+            "deployment_name": "payment-api",
+        }
+        result = await g._check_existing_pr(state)
+        assert result == {"existing_pr": None}
+
+    @pytest.mark.asyncio
+    async def test_finds_matching_pr(self):
+        g = _build_graph()
+        prs = [
+            {"head": {"ref": "fix/auto-remediation-production-payment-api-20240101"}, "html_url": "https://github.com/org/repo/pull/7", "number": 7}
+        ]
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.content = [MagicMock(text=json.dumps(prs))]
+        mock_session.call_tool = AsyncMock(return_value=mock_result)
+
+        with (
+            patch("src.pipeline.graph._github_session_kwargs", new_callable=AsyncMock, return_value={"github_token": "ghp-test"}),
+            patch("src.pipeline.graph.github_mcp_session") as mock_mcp,
+        ):
+            mock_mcp.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_mcp.return_value.__aexit__ = AsyncMock(return_value=False)
+            state = {
+                "ai_config": {"github_token": "ghp-test", "github_base_branch": "main"},
+                "repo_url": "https://github.com/org/repo",
+                "namespace": "production",
+                "deployment_name": "payment-api",
+            }
+            result = await g._check_existing_pr(state)
+
+        assert result["existing_pr"]["pr_url"] == "https://github.com/org/repo/pull/7"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_matching_pr(self):
+        g = _build_graph()
+        prs = [{"head": {"ref": "feature/other-branch"}, "html_url": "...", "number": 1}]
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.content = [MagicMock(text=json.dumps(prs))]
+        mock_session.call_tool = AsyncMock(return_value=mock_result)
+
+        with (
+            patch("src.pipeline.graph._github_session_kwargs", new_callable=AsyncMock, return_value={"github_token": "ghp-test"}),
+            patch("src.pipeline.graph.github_mcp_session") as mock_mcp,
+        ):
+            mock_mcp.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_mcp.return_value.__aexit__ = AsyncMock(return_value=False)
+            state = {
+                "ai_config": {"github_token": "ghp-test", "github_base_branch": "main"},
+                "repo_url": "https://github.com/org/repo",
+                "namespace": "production",
+                "deployment_name": "payment-api",
+            }
+            result = await g._check_existing_pr(state)
+
+        assert result == {"existing_pr": None}
+
+
+# ── _fetch_rag_context ────────────────────────────────────────────────────────
+
+
+class TestFetchRagContext:
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_no_findings(self):
+        g = _build_graph()
+        result = await g._fetch_rag_context([], {"api_key": "sk-test"})
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_no_api_key(self):
+        g = _build_graph()
+        result = await g._fetch_rag_context([{"rule_id": "RES-003"}], {})
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_returns_chunks_on_success(self):
+        g = _build_graph()
+        g._embedding.embed = AsyncMock(return_value=[0.1, 0.2])
+        g._knowledge.search_similar = AsyncMock(return_value=[{"chunkText": "Use cpu limits"}])
+        result = await g._fetch_rag_context(
+            [{"rule_id": "RES-003"}], {"api_key": "sk-test", "provider": "openai"}
+        )
+        assert result == [{"chunkText": "Use cpu limits"}]
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_error(self):
+        g = _build_graph()
+        g._embedding.embed = AsyncMock(side_effect=Exception("embed failed"))
+        result = await g._fetch_rag_context(
+            [{"rule_id": "RES-003"}], {"api_key": "sk-test", "provider": "openai"}
+        )
+        assert result == []

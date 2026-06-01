@@ -174,11 +174,17 @@ _SYSTEM_PROMPT = _SYSTEM_PROMPT_BASE
 def _build_system_prompt(has_github: bool, has_datadog: bool) -> str:
     parts = [_SYSTEM_PROMPT_BASE]
     if has_datadog:
-        parts.append("\nVocê tem acesso às ferramentas do Datadog MCP para consultar métricas, monitors, dashboards e infraestrutura.")
+        parts.append(
+            "\nVocê tem acesso às ferramentas do Datadog MCP para consultar métricas, monitors, dashboards e infraestrutura."
+        )
     else:
-        parts.append("\nAVISO: As ferramentas do Datadog NÃO estão disponíveis nesta sessão. Se o usuário perguntar sobre métricas ou dados do Datadog, informe que as credenciais não estão configuradas e oriente a acessar Configurações → Integrações.")
+        parts.append(
+            "\nAVISO: As ferramentas do Datadog NÃO estão disponíveis nesta sessão. Se o usuário perguntar sobre métricas ou dados do Datadog, informe que as credenciais não estão configuradas e oriente a acessar Configurações → Integrações."
+        )
     if not has_github:
-        parts.append("AVISO: As ferramentas do GitHub NÃO estão disponíveis nesta sessão. Não é possível criar branches, commits ou Pull Requests.")
+        parts.append(
+            "AVISO: As ferramentas do GitHub NÃO estão disponíveis nesta sessão. Não é possível criar branches, commits ou Pull Requests."
+        )
     return "\n".join(parts)
 
 
@@ -244,7 +250,9 @@ class AgentService:
         github_app_installation_id = ai_cfg.get("github_app_installation_id")
 
         if github_auth_mode == "github_app" and github_app_id and github_app_private_key:
-            resolved_installation_id = github_app_installation_id or await resolve_installation_id(github_app_id, github_app_private_key)
+            resolved_installation_id = github_app_installation_id or await resolve_installation_id(
+                github_app_id, github_app_private_key
+            )
             if resolved_installation_id:
                 try:
                     github_session = await stack.enter_async_context(
@@ -254,19 +262,23 @@ class AgentService:
                             github_app_installation_id=resolved_installation_id,
                         )
                     )
-                    tool_list = await github_session.list_tools()
+                    tool_list = await github_session.list_tools()  # type: ignore[union-attr]
                     for tool in tool_list.tools:
                         github_tool_names.add(tool.name)
                         github_mcp_tools.append(_tool_to_openai(tool))
-                    logger.info("GitHub App MCP iniciado", extra={"tenant_id": tenant_id, "tool_count": len(github_tool_names)})
+                    logger.info(
+                        "GitHub App MCP iniciado", extra={"tenant_id": tenant_id, "tool_count": len(github_tool_names)}
+                    )
                 except Exception:
                     logger.exception("GitHub App MCP init falhou — sem tools GitHub neste turno")
             else:
-                logger.warning("GitHub App MCP ignorado — installation_id não encontrado", extra={"tenant_id": tenant_id})
+                logger.warning(
+                    "GitHub App MCP ignorado — installation_id não encontrado", extra={"tenant_id": tenant_id}
+                )
         elif github_token:
             try:
                 github_session = await stack.enter_async_context(github_mcp_session(github_token=github_token))
-                tool_list = await github_session.list_tools()
+                tool_list = await github_session.list_tools()  # type: ignore[union-attr]
                 for tool in tool_list.tools:
                     github_tool_names.add(tool.name)
                     github_mcp_tools.append(_tool_to_openai(tool))
@@ -289,7 +301,7 @@ class AgentService:
                         (dd_config or {}).get("site", "datadoghq.com"),
                     )
                 )
-                tool_list = await dd_session.list_tools()
+                tool_list = await dd_session.list_tools()  # type: ignore[union-attr]
                 for tool in tool_list.tools:
                     dd_tool_names.add(tool.name)
                     dd_mcp_tools.append(_tool_to_openai(tool))
@@ -334,7 +346,9 @@ class AgentService:
             runner = await self._build_runner(session, stack)
             system_prompt = _build_system_prompt(runner.has_github, runner.has_datadog)
             messages = [{"role": "system", "content": system_prompt}] + session.messages
-            async for event in self._llm_loop(session, messages, runner.openai_tools, model_id, ai_config, runner, system_prompt):
+            async for event in self._llm_loop(
+                session, messages, runner.openai_tools, model_id, ai_config, runner, system_prompt
+            ):
                 yield event
 
     async def run_tool_responses(
@@ -418,7 +432,9 @@ class AgentService:
 
             messages = [{"role": "system", "content": system_prompt}] + session.messages
 
-            async for event in self._llm_loop(session, messages, runner.openai_tools, model_id, ai_config, runner, system_prompt):
+            async for event in self._llm_loop(
+                session, messages, runner.openai_tools, model_id, ai_config, runner, system_prompt
+            ):
                 yield event
 
     async def _llm_loop(
@@ -442,7 +458,7 @@ class AgentService:
 
             if text_acc:
                 if text_acc.startswith("FORA_DO_ESCOPO:"):
-                    reason = text_acc[len("FORA_DO_ESCOPO:"):].strip()
+                    reason = text_acc[len("FORA_DO_ESCOPO:") :].strip()
                     session.append_audit({"event": "scope_rejected", "reason": reason})
                     yield _sse({"type": "scope_rejected", "reason": reason})
                     yield _sse({"type": "done"})

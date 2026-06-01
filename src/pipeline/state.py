@@ -33,7 +33,7 @@ class ScorecardRemediationState(TypedDict, total=False):
     # ── populated by resolve_manifest_path ───────────────────────────────────
     detected_environment: Optional[str]
     service_definition: Optional[Dict[str, Any]]  # conteúdo de .titlis/service.yaml
-    effective_base_branch: Optional[str]           # branch resolvido via service.yaml
+    effective_base_branch: Optional[str]  # branch resolvido via service.yaml
 
     # ── human-in-the-loop ────────────────────────────────────────────────────
     approved: Optional[bool]

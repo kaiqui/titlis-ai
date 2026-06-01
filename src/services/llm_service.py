@@ -113,7 +113,7 @@ class LLMService:
                 last_exc = exc
                 if not _is_retryable(exc) or attempt == 2:
                     raise
-                delay = 2.0 ** attempt
+                delay = 2.0**attempt
                 logger.warning(
                     "LLM erro transitório, retentando",
                     extra={"attempt": attempt + 1, "delay": delay, "error": str(exc)},
@@ -153,7 +153,7 @@ class LLMService:
                 last_exc = exc
                 if not _is_retryable(exc) or attempt == 2:
                     raise
-                delay = 2.0 ** attempt
+                delay = 2.0**attempt
                 logger.warning(
                     "LLM stream erro transitório, retentando",
                     extra={"attempt": attempt + 1, "delay": delay, "error": str(exc)},

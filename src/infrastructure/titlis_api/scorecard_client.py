@@ -32,7 +32,7 @@ class ScorecardClient:
             except _RETRYABLE as exc:
                 if attempt == 2:
                     raise
-                delay = 1.0 * (2 ** attempt)
+                delay = 1.0 * (2**attempt)
                 logger.warning(
                     "ScorecardClient GET erro transitório, retentando",
                     extra={"path": path, "attempt": attempt + 1, "delay": delay, "error": str(exc)},
@@ -47,7 +47,7 @@ class ScorecardClient:
             except _RETRYABLE as exc:
                 if attempt == 2:
                     raise
-                delay = 1.0 * (2 ** attempt)
+                delay = 1.0 * (2**attempt)
                 logger.warning(
                     "ScorecardClient POST erro transitório, retentando",
                     extra={"path": path, "attempt": attempt + 1, "delay": delay, "error": str(exc)},
@@ -63,7 +63,9 @@ class ScorecardClient:
         return resp.json()
 
     async def get_scorecard_by_name(self, tenant_id: int, name: str, namespace: str) -> Optional[Dict[str, Any]]:
-        resp = await self._get("/v1/internal/ai/workloads", {"tenantId": tenant_id, "name": name, "namespace": namespace})
+        resp = await self._get(
+            "/v1/internal/ai/workloads", {"tenantId": tenant_id, "name": name, "namespace": namespace}
+        )
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
@@ -78,7 +80,9 @@ class ScorecardClient:
         return resp.json()
 
     async def get_similar_resolved(self, tenant_id: int, rule_id: str, limit: int = 5) -> List[Dict[str, Any]]:
-        resp = await self._get("/v1/internal/ai/similar-resolved", {"tenantId": tenant_id, "ruleId": rule_id, "limit": limit})
+        resp = await self._get(
+            "/v1/internal/ai/similar-resolved", {"tenantId": tenant_id, "ruleId": rule_id, "limit": limit}
+        )
         resp.raise_for_status()
         return resp.json()
 

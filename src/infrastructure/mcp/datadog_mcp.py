@@ -10,6 +10,7 @@ from src.settings import settings
 
 _INIT_TIMEOUT = 30.0
 
+
 # Datadog MCP suporta apenas POST (JSON-RPC). Não suporta GET para SSE de
 # notificações server-initiated. O streamable_http_client 1.27.x inicia um
 # background task que faz GET após o initialize — Datadog retorna 405.
@@ -21,8 +22,9 @@ class _PostOnlyTransport(StreamableHTTPTransport):
 
 # Monkey-patch pontual: substitui StreamableHTTPTransport pelo nosso no módulo
 # para que streamable_http_client use a subclasse ao criar a instância interna.
-import mcp.client.streamable_http as _shttp
-_shttp.StreamableHTTPTransport = _PostOnlyTransport  # type: ignore[attr-defined]
+import mcp.client.streamable_http as _shttp  # noqa: E402
+
+_shttp.StreamableHTTPTransport = _PostOnlyTransport  # type: ignore[attr-defined, misc]
 
 
 @asynccontextmanager

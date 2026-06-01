@@ -1,7 +1,7 @@
 import re
 from typing import Any, Dict, Optional, Tuple
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 _RESOURCE_RE = re.compile(r"(\d+(?:\.\d+)?)(m|Mi|Gi|Ki|Ti|Pi|)?$")
 _MEM_UNITS = {"Mi": 1, "Gi": 1024, "Ki": 1 / 1024, "Ti": 1024 * 1024, "Pi": 1024 * 1024 * 1024}

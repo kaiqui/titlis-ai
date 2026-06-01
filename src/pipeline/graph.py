@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 from typing import Any, Dict
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
@@ -383,8 +383,8 @@ class RemediationGraph:
         }
 
     async def _validate_patch(self, state: ScorecardRemediationState) -> Dict[str, Any]:
-        patched = state.get("patched_manifest", "")
-        current = state.get("current_manifest", "")
+        patched = state.get("patched_manifest") or ""
+        current = state.get("current_manifest") or ""
         errors = []
 
         try:
@@ -493,7 +493,7 @@ class RemediationGraph:
                 pr_number=pr.get("pr_number"),
                 github_branch=pr.get("branch"),
                 repo_url=state.get("repo_url"),
-                finding_ids=[f.get("rule_id") for f in state.get("findings", [])],
+                finding_ids=[f.get("rule_id", "") for f in state.get("findings", [])],
             )
         except Exception:
             logger.exception(
