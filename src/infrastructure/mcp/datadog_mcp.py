@@ -56,7 +56,7 @@ async def datadog_mcp_session(
         _initialized = False
         http_client = httpx.AsyncClient(
             headers={"DD-API-KEY": dd_api_key, **({"DD-APPLICATION-KEY": dd_app_key} if dd_app_key else {})},
-            timeout=httpx.Timeout(30.0, read=300.0),
+            timeout=httpx.Timeout(30.0, read=float(settings.datadog_mcp_read_timeout)),
         )
         try:
             async with http_client:

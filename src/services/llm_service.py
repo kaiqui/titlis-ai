@@ -5,6 +5,7 @@ import httpx
 import litellm
 
 from src.domain.models import TenantAiConfig
+from src.settings import settings
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -95,7 +96,7 @@ class LLMService:
                     model=model_id,
                     messages=messages,
                     api_key=config.api_key,
-                    timeout=90,
+                    timeout=settings.llm_request_timeout,
                     metadata=metadata,
                 )
                 content: str = response.choices[0].message.content or ""
@@ -140,7 +141,7 @@ class LLMService:
                     messages=messages,
                     api_key=config.api_key,
                     stream=True,
-                    timeout=120,
+                    timeout=settings.llm_request_timeout,
                     metadata=metadata,
                 )
                 # Se chegou aqui, conexão estabelecida — itera o stream

@@ -1,4 +1,3 @@
-import asyncio
 import json
 import uuid
 from contextlib import AsyncExitStack
@@ -14,6 +13,7 @@ from src.infrastructure.titlis_api.datadog_config_client import DatadogConfigCli
 from src.infrastructure.titlis_api.scorecard_client import ScorecardClient
 from src.pipeline.session import AgentSession, SessionStore
 from src.services.mcp_adapter import McpAdapter
+from src.settings import settings
 from src.tools.read_tools import build_read_tools
 from src.tools.slo_tools import build_slo_tools
 from src.utils.logger import get_logger
@@ -215,17 +215,17 @@ class _ToolRunner:
         self.has_datadog = has_datadog
 
     async def execute(self, tool_name: str, args: Dict[str, Any]) -> Any:
+        # Sem asyncio.wait_for aqui: a sessão MCP é long-lived por turn e
+        # compartilhada entre múltiplas tool calls. Cancelar via wait_for no
+        # meio de I/O stdio corrompe o estado interno do cliente MCP,
+        # quebrando todas as chamadas subsequentes no mesmo turn.
+        # O timeout de operações MCP no agente é gerenciado pela desconexão
+        # do cliente SSE e pelo keepalive_stream da rota.
         if tool_name in self._github_tool_names and self._github_session is not None:
-            result = await asyncio.wait_for(
-                self._github_session.call_tool(tool_name, args),
-                timeout=_MCP_CALL_TIMEOUT,
-            )
+            result = await self._github_session.call_tool(tool_name, args)
             return _parse_mcp_result(result)
         if tool_name in self._dd_tool_names and self._dd_session is not None:
-            result = await asyncio.wait_for(
-                self._dd_session.call_tool(tool_name, args),
-                timeout=_MCP_CALL_TIMEOUT,
-            )
+            result = await self._dd_session.call_tool(tool_name, args)
             return _parse_mcp_result(result)
         return await self._adapter.execute(tool_name, args)
 
@@ -488,6 +488,7 @@ class AgentService:
         runner: _ToolRunner,
         system_prompt: str = _SYSTEM_PROMPT,
     ) -> AsyncGenerator[str, None]:
+        _prev_read_tool_names: Optional[frozenset] = None
         for _iteration in range(5):
             result: Dict[str, Any] = {}
             async for chunk in self._stream_llm(messages, tools, model_id, ai_config, session, result):
@@ -510,6 +511,17 @@ class AgentService:
 
                 read_proposals = [p for p in proposals if not p.is_write]
                 write_proposals = [p for p in proposals if p.is_write]
+
+                if not write_proposals:
+                    current_read_names: frozenset = frozenset(p.tool_name for p in read_proposals)
+                    if current_read_names and current_read_names == _prev_read_tool_names:
+                        reply = "Não consegui obter as informações necessárias. Tente reformular a pergunta."
+                        session.messages.append({"role": "assistant", "content": reply})
+                        session.append_audit({"event": "loop_detected", "tools": list(current_read_names)})
+                        yield _sse({"type": "message", "content": reply})
+                        yield _sse({"type": "done"})
+                        return
+                    _prev_read_tool_names = current_read_names
 
                 assistant_msg: Dict[str, Any] = {
                     "role": "assistant",
@@ -588,7 +600,7 @@ class AgentService:
             "messages": messages,
             "api_key": ai_config.api_key,
             "stream": True,
-            "request_timeout": 120,
+            "request_timeout": settings.llm_request_timeout,
         }
         if tools:
             kwargs["tools"] = tools

@@ -8,9 +8,18 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_RETRYABLE = (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectTimeout)
+_RETRYABLE_NETWORK = (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectTimeout)
+_RETRYABLE_STATUS = {502, 503, 504}
 
 _POOL = httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=30)
+
+
+def _should_retry(exc: Exception) -> bool:
+    if isinstance(exc, _RETRYABLE_NETWORK):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRYABLE_STATUS
+    return False
 
 
 class ScorecardClient:
@@ -28,9 +37,12 @@ class ScorecardClient:
     async def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> httpx.Response:
         for attempt in range(3):
             try:
-                return await self._client.get(path, params=params)
-            except _RETRYABLE as exc:
-                if attempt == 2:
+                resp = await self._client.get(path, params=params)
+                if resp.status_code in _RETRYABLE_STATUS:
+                    resp.raise_for_status()
+                return resp
+            except Exception as exc:
+                if not _should_retry(exc) or attempt == 2:
                     raise
                 delay = 1.0 * (2**attempt)
                 logger.warning(
@@ -43,9 +55,12 @@ class ScorecardClient:
     async def _post(self, path: str, json: Any, params: Optional[Dict[str, Any]] = None) -> httpx.Response:
         for attempt in range(3):
             try:
-                return await self._client.post(path, json=json, params=params)
-            except _RETRYABLE as exc:
-                if attempt == 2:
+                resp = await self._client.post(path, json=json, params=params)
+                if resp.status_code in _RETRYABLE_STATUS:
+                    resp.raise_for_status()
+                return resp
+            except Exception as exc:
+                if not _should_retry(exc) or attempt == 2:
                     raise
                 delay = 1.0 * (2**attempt)
                 logger.warning(

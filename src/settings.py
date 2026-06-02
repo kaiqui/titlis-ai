@@ -22,6 +22,9 @@ class Settings(BaseSettings):
         validation_alias="DATADOG_MCP_URL",
     )
 
+    llm_request_timeout: int = Field(default=120, validation_alias="LLM_REQUEST_TIMEOUT")
+    datadog_mcp_read_timeout: int = Field(default=60, validation_alias="DATADOG_MCP_READ_TIMEOUT")
+
     rag_enabled: bool = Field(default=True, validation_alias="RAG_ENABLED")
     rag_top_k: int = Field(default=3, validation_alias="RAG_TOP_K")
 
