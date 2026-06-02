@@ -15,6 +15,7 @@ class AgentSession:
     audit_log: List[Dict[str, Any]] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
+    workload_id: Optional[str] = None
 
     def touch(self) -> None:
         self.last_active = time.time()
@@ -30,15 +31,24 @@ class SessionStore:
     def __init__(self) -> None:
         self._sessions: Dict[str, AgentSession] = {}
 
-    def get_or_create(self, session_id: str, tenant_id: int, ai_config: Dict[str, Any]) -> AgentSession:
+    def get_or_create(
+        self,
+        session_id: str,
+        tenant_id: int,
+        ai_config: Dict[str, Any],
+        workload_id: Optional[str] = None,
+    ) -> AgentSession:
         if session_id not in self._sessions:
             self._sessions[session_id] = AgentSession(
                 session_id=session_id,
                 tenant_id=tenant_id,
                 ai_config=ai_config,
+                workload_id=workload_id,
             )
         session = self._sessions[session_id]
         session.ai_config = ai_config
+        if workload_id and not session.workload_id:
+            session.workload_id = workload_id
         session.touch()
         return session
 

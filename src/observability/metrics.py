@@ -67,3 +67,9 @@ ai_feedback_alerts_total = Counter(
     "Alertas disparados por alta taxa de feedback negativo",
     ["rule_id"],
 )
+
+mcp_init_failed_total = Counter(
+    "titlis_ai_mcp_init_failed_total",
+    "Falhas de inicialização de sessão MCP após todos os retries",
+    ["provider"],
+)

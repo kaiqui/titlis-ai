@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 from contextlib import AsyncExitStack
@@ -18,6 +19,8 @@ from src.tools.slo_tools import build_slo_tools
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_MCP_CALL_TIMEOUT = 30.0
 
 # GitHub MCP tools que modificam estado — exigem aprovação humana antes de executar.
 _WRITE_TOOLS: Set[str] = {
@@ -47,7 +50,7 @@ Domínio de atuação:
 - Consulta e ajuste de SLOs
 - Leitura de histórico de remediações anteriores
 - Consulta a repositórios, branches, arquivos e PRs no GitHub (suporte à remediação)
-- Consulta a métricas, monitors, dashboards e infraestrutura no Datadog (suporte a análise de incidentes)
+- Consulta a métricas, monitors, dashboards, aplicações/serviços APM, hosts e infraestrutura no Datadog
 
 Se o usuário perguntar sobre algo completamente fora deste domínio (ex: receitas, esportes, política), responda EXATAMENTE com:
 FORA_DO_ESCOPO: <explicação objetiva do que está fora do escopo e o que você pode ajudar>
@@ -59,6 +62,8 @@ Ao analisar problemas:
 4. Para criar PRs de remediação, use as ferramentas do GitHub MCP (create_branch, push_files, create_pull_request)
 5. Valide que resources nunca são reduzidos antes de criar PRs (never-reduce policy)
 6. Seja objetivo e técnico nas respostas
+7. Para QUALQUER pergunta sobre Datadog (aplicações, serviços, métricas, monitors, dashboards, hosts, alertas, SLOs do Datadog), use imediatamente as ferramentas do Datadog MCP — nunca recuse ou diga que não consegue consultar o Datadog
+8. Após executar qualquer tool de escrita (create_pull_request, push_files, create_branch, merge_pull_request, create_issue, update_issue, update_slo_thresholds), apresente SEMPRE um resumo em PT-BR do que foi feito: o que foi criado/modificado, links retornados (PR URL, issue URL, etc.) e próximos passos relevantes. Nunca encerre silenciosamente após uma operação de escrita.
 
 ## Descoberta automática de repositório e manifests
 
@@ -175,11 +180,11 @@ def _build_system_prompt(has_github: bool, has_datadog: bool) -> str:
     parts = [_SYSTEM_PROMPT_BASE]
     if has_datadog:
         parts.append(
-            "\nVocê tem acesso às ferramentas do Datadog MCP para consultar métricas, monitors, dashboards e infraestrutura."
+            "\nVocê tem acesso às ferramentas do Datadog MCP para consultar métricas, monitors, dashboards, aplicações/serviços APM, hosts e infraestrutura. Use-as imediatamente para qualquer pergunta sobre o Datadog — nunca recuse uma consulta Datadog quando as ferramentas estiverem disponíveis."
         )
     else:
         parts.append(
-            "\nAVISO: As ferramentas do Datadog NÃO estão disponíveis nesta sessão. Se o usuário perguntar sobre métricas ou dados do Datadog, informe que as credenciais não estão configuradas e oriente a acessar Configurações → Integrações."
+            "\nAVISO CRÍTICO: As ferramentas do Datadog NÃO estão disponíveis nesta sessão porque as credenciais não estão configuradas. Para QUALQUER pergunta sobre o Datadog, responda EXATAMENTE: 'As credenciais do Datadog não estão configuradas para este tenant. Acesse Configurações → Integrações → Datadog para configurá-las.' Nunca diga que não consegue consultar o Datadog por falta de capacidade — o problema é somente a ausência de credenciais."
         )
     if not has_github:
         parts.append(
@@ -211,10 +216,16 @@ class _ToolRunner:
 
     async def execute(self, tool_name: str, args: Dict[str, Any]) -> Any:
         if tool_name in self._github_tool_names and self._github_session is not None:
-            result = await self._github_session.call_tool(tool_name, args)
+            result = await asyncio.wait_for(
+                self._github_session.call_tool(tool_name, args),
+                timeout=_MCP_CALL_TIMEOUT,
+            )
             return _parse_mcp_result(result)
         if tool_name in self._dd_tool_names and self._dd_session is not None:
-            result = await self._dd_session.call_tool(tool_name, args)
+            result = await asyncio.wait_for(
+                self._dd_session.call_tool(tool_name, args),
+                timeout=_MCP_CALL_TIMEOUT,
+            )
             return _parse_mcp_result(result)
         return await self._adapter.execute(tool_name, args)
 
@@ -386,6 +397,8 @@ class AgentService:
                         session.append_audit(
                             {"event": "tool_result", "tool": proposal.tool_name, "result": result_str[:500]}
                         )
+                        if proposal.tool_name == "create_pull_request" and session.workload_id:
+                            await self._notify_pr_created(session, args, result)
                         yield _sse(
                             {
                                 "type": "tool_result",
@@ -436,6 +449,34 @@ class AgentService:
                 session, messages, runner.openai_tools, model_id, ai_config, runner, system_prompt
             ):
                 yield event
+
+    async def _notify_pr_created(self, session: AgentSession, args: Dict[str, Any], result: Any) -> None:
+        if not isinstance(result, dict):
+            return
+        pr_url = result.get("html_url") or result.get("url")
+        pr_number = result.get("number")
+        if not pr_url:
+            return
+        try:
+            head = result.get("head") or {}
+            branch = head.get("ref") if isinstance(head, dict) else None
+            base_repo = (result.get("base") or {}).get("repo") or {}
+            repo_url = base_repo.get("html_url") or args.get("repo")
+            await self._scorecard.notify_remediation_started(
+                tenant_id=session.tenant_id,
+                workload_id=session.workload_id,  # type: ignore[arg-type]
+                pr_url=pr_url,
+                pr_number=pr_number,
+                github_branch=branch or args.get("head"),
+                repo_url=repo_url,
+                finding_ids=[],
+            )
+            logger.info(
+                "Remediação registrada via agente",
+                extra={"tenant_id": session.tenant_id, "workload_id": session.workload_id, "pr_url": pr_url},
+            )
+        except Exception:
+            logger.warning("Falha ao registrar remediação via agente", exc_info=True)
 
     async def _llm_loop(
         self,

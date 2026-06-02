@@ -11,10 +11,10 @@ from src.pipeline.graph import (
 
 class TestDetectEnvFromCluster:
     def test_prod_keyword(self):
-        assert _detect_env_from_cluster("prod-us-east") == "prod"
+        assert _detect_env_from_cluster("prod-us-east") == "prd"
 
     def test_production_keyword(self):
-        assert _detect_env_from_cluster("production-cluster") == "prod"
+        assert _detect_env_from_cluster("production-cluster") == "prd"
 
     def test_homolog_keyword(self):
         assert _detect_env_from_cluster("hml-cluster") == "hml"
@@ -32,7 +32,7 @@ class TestDetectEnvFromCluster:
         assert _detect_env_from_cluster("my-cluster-01") == ""
 
     def test_case_insensitive(self):
-        assert _detect_env_from_cluster("PROD-CLUSTER") == "prod"
+        assert _detect_env_from_cluster("PROD-CLUSTER") == "prd"
 
 
 class TestDetectEnvFromNamespace:

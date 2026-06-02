@@ -1,7 +1,7 @@
 import json
 import time
 import uuid
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Dict
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -24,6 +24,11 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 _MAX_RETRIES = 3
+_INTERRUPT_TTL_SECONDS = 600  # 10 min — após esse tempo o confirm/set-path retorna 410
+
+# Mapeia thread_id → timestamp em que o interrupt foi emitido.
+# Persistido em memória do processo (único worker uvicorn com streaming).
+_thread_interrupt_times: Dict[str, float] = {}
 
 
 def _verify_internal_secret(request: Request) -> None:
@@ -74,6 +79,7 @@ async def remediate(body: RemediateRequest, request: Request) -> StreamingRespon
         try:
             async for event in graph.compiled.astream(initial_state, config, stream_mode="updates"):
                 if "__interrupt__" in event:
+                    _thread_interrupt_times[thread_id] = time.time()
                     interrupt_val = event["__interrupt__"][0].value
                     if interrupt_val.get("type") == "manifest_path_required":
                         yield _sse(
@@ -166,6 +172,10 @@ async def confirm_remediation(
 ) -> StreamingResponse:
     _verify_internal_secret(request)
 
+    interrupt_time = _thread_interrupt_times.pop(thread_id, None)
+    if interrupt_time is None or time.time() - interrupt_time > _INTERRUPT_TTL_SECONDS:
+        raise HTTPException(status_code=410, detail="remediation_session_expired")
+
     graph = get_remediation_graph()
     # Reconstrói config sem callbacks — thread já está no checkpointer
     config: dict = {"configurable": {"thread_id": thread_id}}
@@ -227,6 +237,10 @@ async def set_manifest_path(
 ) -> StreamingResponse:
     _verify_internal_secret(request)
 
+    interrupt_time = _thread_interrupt_times.pop(thread_id, None)
+    if interrupt_time is None or time.time() - interrupt_time > _INTERRUPT_TTL_SECONDS:
+        raise HTTPException(status_code=410, detail="remediation_session_expired")
+
     graph = get_remediation_graph()
     config: dict = {"configurable": {"thread_id": thread_id}}
 
@@ -236,6 +250,7 @@ async def set_manifest_path(
                 Command(resume=body.manifest_path), config, stream_mode="updates"
             ):
                 if "__interrupt__" in event:
+                    _thread_interrupt_times[thread_id] = time.time()
                     interrupt_val = event["__interrupt__"][0].value
                     yield _sse(
                         {

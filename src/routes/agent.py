@@ -24,7 +24,7 @@ async def agent_chat(body: AgentChatRequest, request: Request) -> StreamingRespo
     service = get_agent_service()
     store = get_session_store()
 
-    session = store.get_or_create(body.session_id, body.tenant_id, body.ai_config.model_dump())
+    session = store.get_or_create(body.session_id, body.tenant_id, body.ai_config.model_dump(), body.workload_id)
     store.cleanup_expired()
 
     async def _inner():

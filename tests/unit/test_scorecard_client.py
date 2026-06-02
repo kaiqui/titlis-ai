@@ -168,9 +168,7 @@ class TestRetryLogic:
     async def test_retries_on_connect_error(self, client):
         good_response = _make_response(200, {"ok": True})
         client._client = AsyncMock()
-        client._client.get = AsyncMock(
-            side_effect=[httpx.ConnectError("timeout"), good_response]
-        )
+        client._client.get = AsyncMock(side_effect=[httpx.ConnectError("timeout"), good_response])
         with patch("asyncio.sleep", new_callable=AsyncMock):
             result = await client.get_scorecard_by_uid(1, "uid-1")
         assert result == {"ok": True}

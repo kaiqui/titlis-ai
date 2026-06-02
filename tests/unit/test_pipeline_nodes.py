@@ -306,7 +306,11 @@ class TestCheckExistingPr:
     async def test_finds_matching_pr(self):
         g = _build_graph()
         prs = [
-            {"head": {"ref": "fix/auto-remediation-production-payment-api-20240101"}, "html_url": "https://github.com/org/repo/pull/7", "number": 7}
+            {
+                "head": {"ref": "fix/auto-remediation-production-payment-api-20240101"},
+                "html_url": "https://github.com/org/repo/pull/7",
+                "number": 7,
+            }
         ]
         mock_session = AsyncMock()
         mock_result = MagicMock()
@@ -314,7 +318,11 @@ class TestCheckExistingPr:
         mock_session.call_tool = AsyncMock(return_value=mock_result)
 
         with (
-            patch("src.pipeline.graph._github_session_kwargs", new_callable=AsyncMock, return_value={"github_token": "ghp-test"}),
+            patch(
+                "src.pipeline.graph._github_session_kwargs",
+                new_callable=AsyncMock,
+                return_value={"github_token": "ghp-test"},
+            ),
             patch("src.pipeline.graph.github_mcp_session") as mock_mcp,
         ):
             mock_mcp.return_value.__aenter__ = AsyncMock(return_value=mock_session)
@@ -339,7 +347,11 @@ class TestCheckExistingPr:
         mock_session.call_tool = AsyncMock(return_value=mock_result)
 
         with (
-            patch("src.pipeline.graph._github_session_kwargs", new_callable=AsyncMock, return_value={"github_token": "ghp-test"}),
+            patch(
+                "src.pipeline.graph._github_session_kwargs",
+                new_callable=AsyncMock,
+                return_value={"github_token": "ghp-test"},
+            ),
             patch("src.pipeline.graph.github_mcp_session") as mock_mcp,
         ):
             mock_mcp.return_value.__aenter__ = AsyncMock(return_value=mock_session)
@@ -376,16 +388,12 @@ class TestFetchRagContext:
         g = _build_graph()
         g._embedding.embed = AsyncMock(return_value=[0.1, 0.2])
         g._knowledge.search_similar = AsyncMock(return_value=[{"chunkText": "Use cpu limits"}])
-        result = await g._fetch_rag_context(
-            [{"rule_id": "RES-003"}], {"api_key": "sk-test", "provider": "openai"}
-        )
+        result = await g._fetch_rag_context([{"rule_id": "RES-003"}], {"api_key": "sk-test", "provider": "openai"})
         assert result == [{"chunkText": "Use cpu limits"}]
 
     @pytest.mark.asyncio
     async def test_returns_empty_on_error(self):
         g = _build_graph()
         g._embedding.embed = AsyncMock(side_effect=Exception("embed failed"))
-        result = await g._fetch_rag_context(
-            [{"rule_id": "RES-003"}], {"api_key": "sk-test", "provider": "openai"}
-        )
+        result = await g._fetch_rag_context([{"rule_id": "RES-003"}], {"api_key": "sk-test", "provider": "openai"})
         assert result == []

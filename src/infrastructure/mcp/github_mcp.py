@@ -6,7 +6,15 @@ from typing import AsyncIterator, Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from src.observability.metrics import mcp_init_failed_total
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
 _INIT_TIMEOUT = 30.0
+_MAX_INIT_RETRIES = 3
+_INIT_RETRY_DELAYS = [1.0, 2.0]
+_MCP_CALL_TIMEOUT = 30.0
 
 
 @asynccontextmanager
@@ -36,7 +44,33 @@ async def github_mcp_session(
         args=["stdio", "--toolsets", "all"],
         env=env,
     )
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await asyncio.wait_for(session.initialize(), timeout=_INIT_TIMEOUT)
-            yield session
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MAX_INIT_RETRIES):
+        if attempt > 0:
+            delay = _INIT_RETRY_DELAYS[attempt - 1]
+            logger.warning(
+                "GitHub MCP init falhou, tentando novamente",
+                extra={"attempt": attempt + 1, "delay": delay, "error": str(last_exc)[:120]},
+            )
+            await asyncio.sleep(delay)
+
+        _initialized = False
+        try:
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await asyncio.wait_for(session.initialize(), timeout=_INIT_TIMEOUT)
+                    _initialized = True
+                    yield session
+                    return
+        except Exception as exc:
+            if _initialized:
+                raise  # Exception do caller, não do init — propaga imediatamente
+            last_exc = exc
+
+    mcp_init_failed_total.labels(provider="github").inc()
+    logger.critical(
+        "GitHub MCP init falhou após todos os retries — github-mcp-server pode estar morto",
+        extra={"attempts": _MAX_INIT_RETRIES, "error": str(last_exc)[:200]},
+    )
+    raise last_exc  # type: ignore[misc]

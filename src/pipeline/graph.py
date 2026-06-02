@@ -21,6 +21,11 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 _MAX_RETRIES = 3
+_MCP_CALL_TIMEOUT = 30.0
+
+
+async def _call_tool(session: Any, tool_name: str, args: dict) -> Any:
+    return await asyncio.wait_for(session.call_tool(tool_name, args), timeout=_MCP_CALL_TIMEOUT)
 
 
 async def _github_session_kwargs(ai_config: dict) -> dict:
@@ -52,15 +57,18 @@ def _mcp_text(result) -> str:
 
 def _detect_env_from_cluster(cluster_name: str) -> str:
     name = cluster_name.lower()
-    for kw in ("prod", "production"):
-        if kw in name:
-            return "prod"
-    for kw in ("hml", "homolog", "staging", "stg"):
-        if kw in name:
-            return "hml"
-    for kw in ("dev", "development"):
-        if kw in name:
-            return "dev"
+    # Verifica preprod/staging antes de prod para evitar falso positivo ("preprod" contém "prod")
+    if any(kw in name for kw in ("preprod", "pre-prod", "staging", "stg")):
+        return "hml"
+    _exact_prod = name == "prod" or name.endswith("-prod") or name.startswith("prod-") or "production" in name
+    if _exact_prod:
+        return "prd"
+    if "prod" in name:
+        return "prd"
+    if any(kw in name for kw in ("hml", "homolog")):
+        return "hml"
+    if any(kw in name for kw in ("dev", "development")):
+        return "dev"
     return ""
 
 
@@ -119,7 +127,8 @@ class RemediationGraph:
         try:
             owner, name = _parse_repo(repo_url)
             async with github_mcp_session(**kwargs) as session:
-                result = await session.call_tool(
+                result = await _call_tool(
+                    session,
                     "get_file_contents",
                     {"owner": owner, "repo": name, "path": ".titlis/service.yaml"},
                 )
@@ -127,18 +136,18 @@ class RemediationGraph:
                     content = getattr(result, "content", None)
                     err_text = getattr(content[0], "text", "") if content else ""
                     if "not found" in err_text.lower() or "404" in err_text:
+                        logger.debug(".titlis/service.yaml não existe no repo", extra={"repo": f"{owner}/{name}"})
+                    else:
                         logger.warning(
                             "Repo não acessível — PAT pode não ter scope 'repo' para repo privado",
                             extra={"repo": f"{owner}/{name}", "error": err_text[:120]},
                         )
-                    else:
-                        logger.debug(".titlis/service.yaml não existe no repo", extra={"repo": f"{owner}/{name}"})
                     return None
                 text = _mcp_text(result)
                 if text:
                     return yaml.safe_load(text)
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 ".titlis/service.yaml não acessível",
                 extra={"repo_url": repo_url, "error": str(exc)[:120]},
             )
@@ -248,8 +257,10 @@ class RemediationGraph:
         try:
             owner, name = _parse_repo(repo_url)
             async with github_mcp_session(**kwargs) as session:
-                result = await session.call_tool(
-                    "get_file_contents", {"owner": owner, "repo": name, "path": path, "ref": branch}
+                result = await _call_tool(
+                    session,
+                    "get_file_contents",
+                    {"owner": owner, "repo": name, "path": path, "ref": branch},
                 )
                 return _mcp_text(result) or None
         except Exception:
@@ -273,7 +284,8 @@ class RemediationGraph:
         try:
             owner, name = _parse_repo(repo_url)
             async with github_mcp_session(**kwargs) as session:
-                result = await session.call_tool(
+                result = await _call_tool(
+                    session,
                     "list_pull_requests",
                     {"owner": owner, "repo": name, "state": "open", "base": base_branch},
                 )
@@ -355,7 +367,10 @@ class RemediationGraph:
                     "Você é um especialista em Kubernetes. Gere APENAS o conteúdo YAML corrigido do deploy.yaml. "
                     "Não adicione explicações, comentários ou blocos de código markdown. "
                     "Retorne SOMENTE o YAML válido. "
-                    "NUNCA reduza valores de cpu ou memory — apenas aumente ou adicione."
+                    "NUNCA reduza valores de cpu ou memory — apenas aumente ou adicione. "
+                    "CRÍTICO: altere SOMENTE os campos necessários para corrigir os findings listados. "
+                    "Mantenha TODOS os outros campos exatamente como estão no manifest atual — "
+                    "não adicione, remova nem renomeie nenhum outro campo além do que os findings exigem."
                 ),
             },
             {
@@ -447,11 +462,13 @@ class RemediationGraph:
         )
 
         async with github_mcp_session(**kwargs) as session:
-            await session.call_tool(
+            await _call_tool(
+                session,
                 "create_branch",
                 {"owner": owner, "repo": name, "branch": branch_name, "from_branch": base_branch},
             )
-            await session.call_tool(
+            await _call_tool(
+                session,
                 "push_files",
                 {
                     "owner": owner,
@@ -461,7 +478,8 @@ class RemediationGraph:
                     "files": [{"path": path, "content": patched}],
                 },
             )
-            result = await session.call_tool(
+            result = await _call_tool(
+                session,
                 "create_pull_request",
                 {
                     "owner": owner,

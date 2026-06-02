@@ -78,6 +78,7 @@ class AgentChatRequest(BaseModel):
     session_id: str
     message: str
     ai_config: TenantAiConfig
+    workload_id: Optional[str] = None
 
 
 class AgentToolDecision(BaseModel):

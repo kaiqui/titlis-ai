@@ -1,14 +1,20 @@
 import asyncio
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import StreamableHTTPTransport, streamable_http_client
 
+from src.observability.metrics import mcp_init_failed_total
 from src.settings import settings
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 _INIT_TIMEOUT = 30.0
+_MAX_INIT_RETRIES = 3
+_INIT_RETRY_DELAYS = [1.0, 2.0]
 
 
 # Datadog MCP suporta apenas POST (JSON-RPC). Não suporta GET para SSE de
@@ -36,12 +42,38 @@ async def datadog_mcp_session(
     url = settings.datadog_mcp_url or f"https://mcp.{site}/api/unstable/mcp-server/mcp"
     if not dd_api_key:
         raise ValueError("DD-API-KEY ausente — configure as credenciais Datadog em Configurações → Integrações")
-    http_client = httpx.AsyncClient(
-        headers={"DD-API-KEY": dd_api_key, **({"DD-APPLICATION-KEY": dd_app_key} if dd_app_key else {})},
-        timeout=httpx.Timeout(30.0, read=300.0),
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MAX_INIT_RETRIES):
+        if attempt > 0:
+            delay = _INIT_RETRY_DELAYS[attempt - 1]
+            logger.warning(
+                "Datadog MCP init falhou, tentando novamente",
+                extra={"attempt": attempt + 1, "delay": delay, "error": str(last_exc)[:120]},
+            )
+            await asyncio.sleep(delay)
+
+        _initialized = False
+        http_client = httpx.AsyncClient(
+            headers={"DD-API-KEY": dd_api_key, **({"DD-APPLICATION-KEY": dd_app_key} if dd_app_key else {})},
+            timeout=httpx.Timeout(30.0, read=300.0),
+        )
+        try:
+            async with http_client:
+                async with streamable_http_client(url, http_client=http_client) as (read, write, _):
+                    async with ClientSession(read, write) as session:
+                        await asyncio.wait_for(session.initialize(), timeout=_INIT_TIMEOUT)
+                        _initialized = True
+                        yield session
+                        return
+        except Exception as exc:
+            if _initialized:
+                raise  # Exception do caller, não do init — propaga imediatamente
+            last_exc = exc
+
+    mcp_init_failed_total.labels(provider="datadog").inc()
+    logger.critical(
+        "Datadog MCP init falhou após todos os retries",
+        extra={"attempts": _MAX_INIT_RETRIES, "error": str(last_exc)[:200]},
     )
-    async with http_client:
-        async with streamable_http_client(url, http_client=http_client) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await asyncio.wait_for(session.initialize(), timeout=_INIT_TIMEOUT)
-                yield session
+    raise last_exc  # type: ignore[misc]

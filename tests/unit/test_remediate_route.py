@@ -1,7 +1,9 @@
+import time
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
+import src.routes.remediate as remediate_module
 from src.main import app
 from src.settings import settings
 
@@ -136,6 +138,7 @@ class TestConfirmRemediationRoute:
         mock_graph = MagicMock()
         mock_graph.compiled.astream = _fake_astream_confirm_pr()
 
+        remediate_module._thread_interrupt_times["test-thread-id"] = time.time()
         with patch("src.routes.remediate.get_remediation_graph", return_value=mock_graph):
             resp = client.post(
                 "/v1/remediate/test-thread-id/confirm",
@@ -158,6 +161,7 @@ class TestConfirmRemediationRoute:
         mock_graph = MagicMock()
         mock_graph.compiled.astream = _empty_stream
 
+        remediate_module._thread_interrupt_times["test-thread-id"] = time.time()
         with patch("src.routes.remediate.get_remediation_graph", return_value=mock_graph):
             resp = client.post(
                 "/v1/remediate/test-thread-id/confirm",
