@@ -120,7 +120,12 @@ class RemediationGraph:
             "live_deployment": scorecard,
         }
 
-    async def _read_service_yaml(self, repo_url: str, ai_config: dict) -> Dict[str, Any] | None:
+    async def _read_service_yaml(
+        self,
+        repo_url: str,
+        ai_config: dict,
+        path: str = ".titlis/service.yaml",
+    ) -> Dict[str, Any] | None:
         kwargs = await _github_session_kwargs(ai_config)
         if not kwargs:
             return None
@@ -130,13 +135,13 @@ class RemediationGraph:
                 result = await _call_tool(
                     session,
                     "get_file_contents",
-                    {"owner": owner, "repo": name, "path": ".titlis/service.yaml"},
+                    {"owner": owner, "repo": name, "path": path},
                 )
                 if getattr(result, "isError", False):
                     content = getattr(result, "content", None)
                     err_text = getattr(content[0], "text", "") if content else ""
                     if "not found" in err_text.lower() or "404" in err_text:
-                        logger.debug(".titlis/service.yaml não existe no repo", extra={"repo": f"{owner}/{name}"})
+                        logger.debug("service.yaml não existe no repo", extra={"repo": f"{owner}/{name}", "path": path})
                     else:
                         logger.warning(
                             "Repo não acessível — PAT pode não ter scope 'repo' para repo privado",
@@ -177,9 +182,10 @@ class RemediationGraph:
             or "unknown"
         )
 
-        # Tenta ler .titlis/service.yaml automaticamente
+        # Tenta ler o service.yaml (caminho configurado no vínculo; default raiz do repo)
+        svc_yaml_path = (state.get("service_yaml_path") or ".titlis/service.yaml").strip().lstrip("/")
         if repo_url:
-            svc = await self._read_service_yaml(repo_url, ai_config)
+            svc = await self._read_service_yaml(repo_url, ai_config, svc_yaml_path)
             if svc:
                 gitops_paths = svc.get("spec", {}).get("gitops", {}).get("paths", {})
                 path_cfg = gitops_paths.get(env) or gitops_paths.get(next(iter(gitops_paths), ""), {})
@@ -344,11 +350,27 @@ class RemediationGraph:
         analysis = await self._llm.chat(messages, _to_ai_config(ai_config), state.get("tenant_id", 0))
         return {"analysis": analysis}
 
+    @staticmethod
+    def _detect_deployments_in_manifest(manifest: str) -> list[str]:
+        names = []
+        try:
+            docs = list(yaml.safe_load_all(manifest))
+            for doc in docs:
+                if isinstance(doc, dict) and doc.get("kind") == "Deployment":
+                    meta = doc.get("metadata") or {}
+                    name = meta.get("name", "")
+                    if name:
+                        names.append(name)
+        except yaml.YAMLError:
+            pass
+        return names
+
     async def _generate_yaml_patch(self, state: ScorecardRemediationState) -> Dict[str, Any]:
         ai_config = state.get("ai_config", {})
         analysis = state.get("analysis", "")
         current_manifest = state.get("current_manifest", "")
         findings = state.get("findings", [])
+        deployment_name = state.get("deployment_name", "")
         retry_count = state.get("retry_count", 0)
         validation_errors = state.get("validation_errors", [])
 
@@ -359,6 +381,25 @@ class RemediationGraph:
         findings_str = "\n".join(
             f"- {f.get('rule_id')}: {f.get('message', '')} (actual={f.get('actual_value', 'N/A')})" for f in findings
         )
+
+        # Detecta múltiplos Deployments no arquivo para proteger os não-alvo
+        multi_deployment_guard = ""
+        if current_manifest:
+            all_deployments = self._detect_deployments_in_manifest(current_manifest)
+            other_deployments = [d for d in all_deployments if d != deployment_name]
+            if other_deployments:
+                others_list = ", ".join(f"`{d}`" for d in other_deployments)
+                multi_deployment_guard = (
+                    f"\n\nAVISO CRÍTICO — este arquivo contém múltiplos Deployments: "
+                    f"{others_list} além de `{deployment_name}`. "
+                    f"Modifique EXCLUSIVAMENTE o Deployment `{deployment_name}`. "
+                    f"Os outros Deployments devem ser retornados exatamente como estão no manifest atual — "
+                    f"sem nenhuma alteração, mesmo que pareçam ter problemas."
+                )
+                logger.info(
+                    "Múltiplos Deployments detectados no manifest",
+                    extra={"target": deployment_name, "others": other_deployments},
+                )
 
         messages = [
             {
@@ -371,11 +412,13 @@ class RemediationGraph:
                     "CRÍTICO: altere SOMENTE os campos necessários para corrigir os findings listados. "
                     "Mantenha TODOS os outros campos exatamente como estão no manifest atual — "
                     "não adicione, remova nem renomeie nenhum outro campo além do que os findings exigem."
+                    f"{multi_deployment_guard}"
                 ),
             },
             {
                 "role": "user",
                 "content": (
+                    f"**Deployment alvo:** `{deployment_name}` (namespace: `{state.get('namespace', '')}`)\n\n"
                     f"**Análise:**\n{analysis}\n\n"
                     f"**Findings a corrigir:**\n{findings_str}\n\n"
                     f"**Manifest atual:**\n{current_manifest or 'não disponível'}"

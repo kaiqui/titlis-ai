@@ -9,6 +9,7 @@ class ScorecardRemediationState(TypedDict, total=False):
     finding_ids: List[str]  # rule IDs requested for remediation
     repo_url: str
     deploy_manifest_path: str
+    service_yaml_path: str  # caminho do .titlis/service.yaml no repo (suporta monorepo)
     ai_config: Dict[str, Any]
 
     # ── populated by classify_findings ───────────────────────────────────────

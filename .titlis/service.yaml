@@ -1,10 +1,8 @@
-apiVersion: titlis.io/v1
-kind: ServiceDefinition
 metadata:
   name: titlis-ai
   workload_match:
     namespaces: [titlis-preprod, titlis-prod]
-    name_pattern: "^titlis-ai(-.*)?$"
+    name_pattern: "^titlis-ai$"
 spec:
   owner:
     team: platform
@@ -12,7 +10,6 @@ spec:
       - type: slack
         value: "#platform-oncall"
   gitops:
-    layout: folder_per_env
     paths:
       dev:
         path: manifest/kubernetes/develop/deploy.yaml
@@ -23,11 +20,5 @@ spec:
       prd:
         path: manifest/kubernetes/main/deploy.yaml
         base_branch: main
-    pipeline_watcher: argocd
   remediation:
     enabled: true
-    overrides:
-      hpa_environment_templates:
-        dev: { min: 1, max: 2, target_cpu: 80 }
-        hml: { min: 1, max: 3, target_cpu: 80 }
-        prd: { min: 2, max: 6, target_cpu: 70 }

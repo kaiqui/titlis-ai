@@ -37,6 +37,7 @@ class RemediateRequest(BaseModel):
     finding_ids: List[str]  # rule IDs a remediar (vazio = todos os falhos)
     repo_url: str
     deploy_manifest_path: str = "manifests/kubernetes/main/deploy.yaml"
+    service_yaml_path: str = ".titlis/service.yaml"
     ai_config: TenantAiConfig
 
 

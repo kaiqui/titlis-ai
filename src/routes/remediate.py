@@ -68,6 +68,7 @@ async def remediate(body: RemediateRequest, request: Request) -> StreamingRespon
         "finding_ids": body.finding_ids,
         "repo_url": body.repo_url,
         "deploy_manifest_path": body.deploy_manifest_path,
+        "service_yaml_path": body.service_yaml_path,
         "ai_config": body.ai_config.model_dump(),
         "retry_count": 0,
         "validation_errors": [],

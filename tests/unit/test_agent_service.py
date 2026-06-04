@@ -1,4 +1,3 @@
-import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -70,13 +69,13 @@ class TestToolRunner:
     @pytest.mark.asyncio
     async def test_routes_github_tool(self):
         runner = self._make_runner()
-        result = await runner.execute("create_pull_request", {"title": "fix"})
+        await runner.execute("create_pull_request", {"title": "fix"})
         runner._github_session.call_tool.assert_called_once_with("create_pull_request", {"title": "fix"})
 
     @pytest.mark.asyncio
     async def test_routes_datadog_tool(self):
         runner = self._make_runner()
-        result = await runner.execute("query_metrics", {"query": "avg:cpu"})
+        await runner.execute("query_metrics", {"query": "avg:cpu"})
         runner._dd_session.call_tool.assert_called_once_with("query_metrics", {"query": "avg:cpu"})
 
     @pytest.mark.asyncio
@@ -98,7 +97,7 @@ class TestToolRunner:
             github_tool_names={"create_pull_request"},
             dd_tool_names=set(),
         )
-        result = await runner.execute("create_pull_request", {})
+        await runner.execute("create_pull_request", {})
         adapter.execute.assert_called_once()
 
 
