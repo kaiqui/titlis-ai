@@ -233,3 +233,117 @@ class TestConfirmRemediationRoute:
 
         assert resp.status_code == 200
         assert '"type": "done"' in resp.text or '"type":"done"' in resp.text
+
+
+class TestSubmitServiceYamlRoute:
+    def _payload(self) -> dict:
+        return {
+            "manifest_path": "k8s/deploy.yaml",
+            "base_branch": "main",
+            "name": "payment-api",
+            "team": "payments",
+            "namespaces": ["production"],
+            "name_pattern": "^payment-api$",
+            "env": "prd",
+        }
+
+    def test_returns_403_without_secret(self):
+        client = TestClient(app)
+        resp = client.post("/v1/remediate/some-thread/submit-service-yaml", json=self._payload())
+        assert resp.status_code == 403
+
+    def test_returns_410_when_session_expired(self):
+        client = TestClient(app)
+        resp = client.post(
+            "/v1/remediate/nonexistent-thread/submit-service-yaml",
+            json=self._payload(),
+            headers=_headers(),
+        )
+        assert resp.status_code == 410
+
+    def test_streams_fix_ready_event(self):
+        client = TestClient(app, raise_server_exceptions=False)
+
+        mock_graph = MagicMock()
+        mock_graph.compiled.astream = _fake_astream_fix_ready()
+        mock_graph.compiled.get_state = MagicMock(return_value=MagicMock(values={}))
+
+        remediate_module._thread_interrupt_times["svc-yaml-thread"] = time.time()
+        with patch("src.routes.remediate.get_remediation_graph", return_value=mock_graph):
+            resp = client.post(
+                "/v1/remediate/svc-yaml-thread/submit-service-yaml",
+                json=self._payload(),
+                headers=_headers(),
+            )
+
+        assert resp.status_code == 200
+        assert "fix_ready" in resp.text
+        assert '"type": "done"' in resp.text or '"type":"done"' in resp.text
+
+    def test_streams_service_yaml_required_event_on_remediate(self):
+        client = TestClient(app, raise_server_exceptions=False)
+
+        async def _svc_yaml_interrupt(*args, **kwargs):
+            yield {
+                "__interrupt__": [
+                    MagicMock(
+                        value={
+                            "type": "service_yaml_required",
+                            "detected_environment": "prd",
+                            "deployment_name": "payment-api",
+                            "namespace": "production",
+                            "suggested_path": "k8s/deploy.yaml",
+                            "prefill": {"name": "payment-api", "team": "", "base_branch": "main"},
+                        }
+                    )
+                ]
+            }
+
+        mock_graph = MagicMock()
+        mock_graph.compiled.astream = _svc_yaml_interrupt
+        mock_graph.compiled.get_state = MagicMock(return_value=MagicMock(values={}))
+
+        with patch("src.routes.remediate.get_remediation_graph", return_value=mock_graph):
+            resp = client.post("/v1/remediate", json=_remediate_payload(), headers=_headers())
+
+        assert resp.status_code == 200
+        assert "service_yaml_required" in resp.text
+        assert "prefill" in resp.text
+
+    def test_fix_ready_contains_files_field(self):
+        client = TestClient(app, raise_server_exceptions=False)
+
+        async def _fix_ready_with_files(*args, **kwargs):
+            yield {
+                "__interrupt__": [
+                    MagicMock(
+                        value={
+                            "patched_manifest": "yaml: patched",
+                            "current_manifest": "yaml: current",
+                            "findings": ["RES-003"],
+                            "deployment_name": "payment-api",
+                            "namespace": "production",
+                            "files": [
+                                {"path": "k8s/deploy.yaml", "current": "yaml: current", "patched": "yaml: patched", "is_new": False}
+                            ],
+                        }
+                    )
+                ]
+            }
+
+        mock_graph = MagicMock()
+        mock_graph.compiled.astream = _fix_ready_with_files
+        mock_graph.compiled.get_state = MagicMock(return_value=MagicMock(values={}))
+
+        with patch("src.routes.remediate.get_remediation_graph", return_value=mock_graph):
+            resp = client.post("/v1/remediate", json=_remediate_payload(), headers=_headers())
+
+        assert resp.status_code == 200
+        fix_ready_line = next(
+            (line for line in resp.text.splitlines() if "fix_ready" in line and line.startswith("data:")),
+            None,
+        )
+        assert fix_ready_line is not None
+        event = _json.loads(fix_ready_line.removeprefix("data: "))
+        assert "files" in event
+        assert event["files"][0]["path"] == "k8s/deploy.yaml"

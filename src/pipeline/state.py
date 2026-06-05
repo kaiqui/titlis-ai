@@ -37,6 +37,11 @@ class ScorecardRemediationState(TypedDict, total=False):
     service_definition: Optional[Dict[str, Any]]  # conteúdo de .titlis/service.yaml
     effective_base_branch: Optional[str]  # branch resolvido via service.yaml
 
+    # ── populated by resolve_manifest_path (service.yaml ausente) ────────────
+    service_yaml_missing: bool
+    generated_service_yaml: Optional[str]
+    service_yaml_prefill: Optional[Dict[str, Any]]
+
     # ── human-in-the-loop ────────────────────────────────────────────────────
     approved: Optional[bool]
 

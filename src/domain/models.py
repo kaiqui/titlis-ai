@@ -49,6 +49,18 @@ class SetManifestPathRequest(BaseModel):
     manifest_path: str
 
 
+class SubmitServiceYamlRequest(BaseModel):
+    manifest_path: str
+    base_branch: str
+    name: str
+    team: str
+    namespaces: List[str]
+    name_pattern: str
+    env: str = "dev"
+    contacts: Optional[List[Dict[str, Any]]] = None
+    extra_paths: Optional[Dict[str, Any]] = None
+
+
 class SseChunk(BaseModel):
     type: str
     content: Optional[str] = None

@@ -164,6 +164,34 @@ def _detect_env_from_namespace(namespace: str) -> str:
     return ""
 
 
+def _render_service_yaml(form: dict) -> str:
+    env = form.get("env") or "dev"
+    path_entry: dict = {"path": form.get("path", ""), "base_branch": form.get("base_branch", "main")}
+    paths: dict = {env: path_entry}
+    if form.get("extra_paths"):
+        paths.update(form["extra_paths"])
+
+    owner_block: dict = {"team": form.get("team", "")}
+    if form.get("contacts"):
+        owner_block["contacts"] = form["contacts"]
+
+    doc = {
+        "metadata": {
+            "name": form.get("name", ""),
+            "workload_match": {
+                "namespaces": form.get("namespaces") or [],
+                "name_pattern": form.get("name_pattern", ""),
+            },
+        },
+        "spec": {
+            "owner": owner_block,
+            "gitops": {"paths": paths},
+            "remediation": {"enabled": True},
+        },
+    }
+    return yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
+
+
 class RemediationGraph:
     def __init__(
         self,
@@ -297,25 +325,45 @@ class RemediationGraph:
                         "service_definition": svc,
                     }
 
-        # Fallback: pede confirmação ao usuário
-        confirmed_path = interrupt(
+        # Fallback: service.yaml ausente — pede ao dev para criar via formulário
+        deployment_name = state.get("deployment_name", "")
+        base_branch = ai_config.get("github_base_branch") or "main"
+        suggested_path = state.get("deploy_manifest_path", "")
+        prefill = {
+            "name": deployment_name,
+            "team": labels.get("titlis.io/team") or labels.get("team") or "",
+            "name_pattern": f"^{deployment_name}$" if deployment_name else "",
+            "namespaces": [namespace] if namespace else [],
+            "env": env if env and env != "unknown" else "dev",
+            "path": suggested_path,
+            "base_branch": base_branch,
+        }
+        form = interrupt(
             {
-                "type": "manifest_path_required",
+                "type": "service_yaml_required",
                 "detected_environment": env,
-                "suggested_path": state.get("deploy_manifest_path", ""),
-                "deployment_name": state.get("deployment_name", ""),
+                "deployment_name": deployment_name,
                 "namespace": namespace,
-                "hint": (
-                    "Não foi possível ler .titlis/service.yaml automaticamente. "
-                    "Se o repositório for privado, verifique se o PAT tem o scope 'repo' "
-                    "(e 'read:org' para repos de organizações) em Configurações → Integrações. "
-                    "Caso as credenciais estejam corretas, adicione .titlis/service.yaml ao repo."
-                ),
+                "suggested_path": suggested_path,
+                "prefill": prefill,
             }
         )
 
+        if isinstance(form, dict):
+            generated_yaml = _render_service_yaml(form)
+            return {
+                "deploy_manifest_path": form.get("path", suggested_path),
+                "effective_base_branch": form.get("base_branch") or base_branch,
+                "detected_environment": env,
+                "generated_service_yaml": generated_yaml,
+                "service_yaml_missing": True,
+                "service_yaml_path": svc_yaml_path,
+                "service_yaml_prefill": prefill,
+            }
+
+        # fallback de segurança se resume for uma string (caminho direto legado)
         return {
-            "deploy_manifest_path": str(confirmed_path),
+            "deploy_manifest_path": str(form),
             "detected_environment": env,
         }
 
@@ -711,6 +759,23 @@ class RemediationGraph:
         return {"validation_errors": errors}
 
     async def _await_user_confirmation(self, state: ScorecardRemediationState) -> Dict[str, Any]:
+        files = [
+            {
+                "path": state.get("deploy_manifest_path", ""),
+                "current": state.get("current_manifest") or "",
+                "patched": state.get("patched_manifest") or "",
+                "is_new": False,
+            }
+        ]
+        if state.get("generated_service_yaml"):
+            files.append(
+                {
+                    "path": state.get("service_yaml_path") or ".titlis/service.yaml",
+                    "current": "",
+                    "patched": state.get("generated_service_yaml", ""),
+                    "is_new": True,
+                }
+            )
         approved = interrupt(
             {
                 "patched_manifest": state.get("patched_manifest"),
@@ -718,6 +783,7 @@ class RemediationGraph:
                 "findings": [f.get("rule_id") for f in state.get("findings", [])],
                 "deployment_name": state.get("deployment_name"),
                 "namespace": state.get("namespace"),
+                "files": files,
             }
         )
         return {"approved": bool(approved)}
@@ -736,12 +802,15 @@ class RemediationGraph:
         owner, name = _parse_repo(repo_url)
         ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         branch_name = f"fix/auto-remediation-{namespace}-{deployment_name}-{ts}"
+        has_new_svc_yaml = bool(state.get("generated_service_yaml"))
+        svc_yaml_note = "\n- Criação de `.titlis/service.yaml`" if has_new_svc_yaml else ""
         commit_msg = f"fix(titlis-ai): auto-remediation {deployment_name} [{', '.join(findings)}]"
         pr_body = (
             f"## Remediação automática — {deployment_name}\n\n"
             f"**Namespace:** {namespace}\n\n"
             f"**Findings corrigidos:**\n"
             + "\n".join(f"- {f}" for f in findings)
+            + svc_yaml_note
             + "\n\n*Gerado pelo Titlis AI Assistant*"
         )
 
@@ -759,7 +828,18 @@ class RemediationGraph:
                 {"owner": owner, "repo": name, "branch": branch_name, "from_branch": base_branch},
             )
 
-            logger.info("Fazendo push do manifesto", extra={"path": path, "branch": branch_name})
+            files_to_push = [{"path": path, "content": patched}]
+            if has_new_svc_yaml:
+                files_to_push.append(
+                    {
+                        "path": state.get("service_yaml_path") or ".titlis/service.yaml",
+                        "content": state["generated_service_yaml"],
+                    }
+                )
+            logger.info(
+                "Fazendo push de arquivos",
+                extra={"paths": [f["path"] for f in files_to_push], "branch": branch_name},
+            )
             await _call_tool_strict(
                 session,
                 "push_files",
@@ -768,7 +848,7 @@ class RemediationGraph:
                     "repo": name,
                     "branch": branch_name,
                     "message": commit_msg,
-                    "files": [{"path": path, "content": patched}],
+                    "files": files_to_push,
                 },
             )
 

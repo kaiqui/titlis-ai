@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 
 from src.bootstrap.dependencies import get_remediation_graph
-from src.domain.models import ConfirmRemediationRequest, RemediateRequest, SetManifestPathRequest
+from src.domain.models import ConfirmRemediationRequest, RemediateRequest, SetManifestPathRequest, SubmitServiceYamlRequest
 from src.observability.langfuse_handler import get_langfuse_callbacks
 from src.observability.metrics import (
     ai_latency_seconds,
@@ -82,7 +82,20 @@ async def remediate(body: RemediateRequest, request: Request) -> StreamingRespon
                 if "__interrupt__" in event:
                     _thread_interrupt_times[thread_id] = time.time()
                     interrupt_val = event["__interrupt__"][0].value
-                    if interrupt_val.get("type") == "manifest_path_required":
+                    interrupt_type = interrupt_val.get("type")
+                    if interrupt_type == "service_yaml_required":
+                        yield _sse(
+                            {
+                                "type": "service_yaml_required",
+                                "thread_id": thread_id,
+                                "detected_environment": interrupt_val.get("detected_environment"),
+                                "deployment_name": interrupt_val.get("deployment_name"),
+                                "namespace": interrupt_val.get("namespace"),
+                                "suggested_path": interrupt_val.get("suggested_path"),
+                                "prefill": interrupt_val.get("prefill", {}),
+                            }
+                        )
+                    elif interrupt_type == "manifest_path_required":
                         yield _sse(
                             {
                                 "type": "path_required",
@@ -103,6 +116,7 @@ async def remediate(body: RemediateRequest, request: Request) -> StreamingRespon
                                 "findings": interrupt_val.get("findings", []),
                                 "deployment_name": interrupt_val.get("deployment_name"),
                                 "namespace": interrupt_val.get("namespace"),
+                                "files": interrupt_val.get("files"),
                             }
                         )
                     yield _sse({"type": "done"})
@@ -262,6 +276,7 @@ async def set_manifest_path(
                             "findings": interrupt_val.get("findings", []),
                             "deployment_name": interrupt_val.get("deployment_name"),
                             "namespace": interrupt_val.get("namespace"),
+                            "files": interrupt_val.get("files"),
                         }
                     )
                     yield _sse({"type": "done"})
@@ -291,6 +306,92 @@ async def set_manifest_path(
         async for chunk in keepalive_stream(_inner()):
             if await request.is_disconnected():
                 logger.info("Cliente desconectou (set-path)", extra={"thread_id": thread_id})
+                break
+            yield chunk
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/remediate/{thread_id}/submit-service-yaml")
+async def submit_service_yaml(
+    thread_id: str,
+    body: SubmitServiceYamlRequest,
+    request: Request,
+) -> StreamingResponse:
+    _verify_internal_secret(request)
+
+    interrupt_time = _thread_interrupt_times.pop(thread_id, None)
+    if interrupt_time is None or time.time() - interrupt_time > _INTERRUPT_TTL_SECONDS:
+        raise HTTPException(status_code=410, detail="remediation_session_expired")
+
+    graph = get_remediation_graph()
+    config: dict = {"configurable": {"thread_id": thread_id}}
+
+    form_dict: dict = {
+        "path": body.manifest_path,
+        "base_branch": body.base_branch,
+        "name": body.name,
+        "team": body.team,
+        "namespaces": body.namespaces,
+        "name_pattern": body.name_pattern,
+        "env": body.env,
+    }
+    if body.contacts:
+        form_dict["contacts"] = body.contacts
+    if body.extra_paths:
+        form_dict["extra_paths"] = body.extra_paths
+
+    async def _inner() -> AsyncGenerator[str, None]:
+        try:
+            async for event in graph.compiled.astream(
+                Command(resume=form_dict), config, stream_mode="updates"
+            ):
+                if "__interrupt__" in event:
+                    _thread_interrupt_times[thread_id] = time.time()
+                    interrupt_val = event["__interrupt__"][0].value
+                    yield _sse(
+                        {
+                            "type": "fix_ready",
+                            "thread_id": thread_id,
+                            "patched_manifest": interrupt_val.get("patched_manifest"),
+                            "current_manifest": interrupt_val.get("current_manifest"),
+                            "findings": interrupt_val.get("findings", []),
+                            "deployment_name": interrupt_val.get("deployment_name"),
+                            "namespace": interrupt_val.get("namespace"),
+                            "files": interrupt_val.get("files"),
+                        }
+                    )
+                    yield _sse({"type": "done"})
+                    return
+
+                for node_name, node_output in event.items():
+                    if node_name.startswith("__"):
+                        continue
+                    if node_name == "check_existing_pr":
+                        existing = (node_output or {}).get("existing_pr")
+                        if existing:
+                            yield _sse({"type": "existing_pr", "pr_url": existing["pr_url"]})
+                    yield _sse({"type": "progress", "node": node_name})
+
+            final = graph.compiled.get_state(config)
+            state_vals = final.values if final else {}
+            if state_vals.get("validation_errors") and state_vals.get("retry_count", 0) >= _MAX_RETRIES:
+                yield _sse({"type": "error", "error": "patch_validation_failed_max_retries"})
+            yield _sse({"type": "done"})
+
+        except Exception as exc:
+            logger.exception("Erro ao submeter service.yaml", extra={"thread_id": thread_id})
+            yield _sse({"type": "error", "error": str(exc)})
+            yield _sse({"type": "done"})
+
+    async def generate() -> AsyncGenerator[str, None]:
+        async for chunk in keepalive_stream(_inner()):
+            if await request.is_disconnected():
+                logger.info("Cliente desconectou (submit-service-yaml)", extra={"thread_id": thread_id})
                 break
             yield chunk
 

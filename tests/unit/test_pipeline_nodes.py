@@ -604,3 +604,177 @@ class TestSyncClosedPrStatus:
         await g._sync_closed_pr_status(mock_session, "org", "repo", tenant_id=1, workload_id="uid-abc")
 
         scorecard.notify_pr_closed.assert_not_called()
+
+
+# ── _render_service_yaml ──────────────────────────────────────────────────────
+
+
+class TestRenderServiceYaml:
+    def test_minimal_form_produces_valid_yaml(self):
+        import yaml as _yaml
+        from src.pipeline.graph import _render_service_yaml
+
+        form = {
+            "name": "payment-api",
+            "team": "payments",
+            "name_pattern": "^payment-api$",
+            "namespaces": ["production"],
+            "env": "prd",
+            "path": "k8s/deploy.yaml",
+            "base_branch": "main",
+        }
+        result = _render_service_yaml(form)
+        parsed = _yaml.safe_load(result)
+        assert parsed["metadata"]["name"] == "payment-api"
+        assert parsed["spec"]["owner"]["team"] == "payments"
+        assert "prd" in parsed["spec"]["gitops"]["paths"]
+        assert parsed["spec"]["gitops"]["paths"]["prd"]["path"] == "k8s/deploy.yaml"
+        assert parsed["spec"]["remediation"]["enabled"] is True
+
+    def test_advanced_form_includes_contacts_and_extra_paths(self):
+        import yaml as _yaml
+        from src.pipeline.graph import _render_service_yaml
+
+        form = {
+            "name": "auth-service",
+            "team": "platform",
+            "name_pattern": "^auth.*$",
+            "namespaces": ["prod"],
+            "env": "prd",
+            "path": "manifests/deploy.yaml",
+            "base_branch": "release",
+            "contacts": [{"type": "slack", "value": "#platform"}],
+            "extra_paths": {"hml": {"path": "manifests/hml/deploy.yaml", "base_branch": "main"}},
+        }
+        result = _render_service_yaml(form)
+        parsed = _yaml.safe_load(result)
+        assert parsed["spec"]["owner"]["contacts"] == [{"type": "slack", "value": "#platform"}]
+        assert "hml" in parsed["spec"]["gitops"]["paths"]
+
+    def test_empty_team_produces_valid_yaml(self):
+        import yaml as _yaml
+        from src.pipeline.graph import _render_service_yaml
+
+        form = {
+            "name": "svc",
+            "team": "",
+            "name_pattern": "^svc$",
+            "namespaces": [],
+            "env": "dev",
+            "path": "deploy.yaml",
+            "base_branch": "main",
+        }
+        result = _render_service_yaml(form)
+        parsed = _yaml.safe_load(result)
+        assert isinstance(parsed, dict)
+
+
+# ── _resolve_manifest_path — service_yaml_required ───────────────────────────
+
+
+class TestResolveManifestPathServiceYamlRequired:
+    @pytest.mark.asyncio
+    async def test_resume_with_dict_generates_service_yaml(self):
+        import yaml as _yaml
+        from unittest.mock import patch
+
+        g = _build_graph()
+        form = {
+            "path": "k8s/deploy.yaml",
+            "base_branch": "main",
+            "name": "payment-api",
+            "team": "payments",
+            "namespaces": ["production"],
+            "name_pattern": "^payment-api$",
+            "env": "prd",
+        }
+        state = {
+            "ai_config": {"github_base_branch": "main"},
+            "repo_url": "",
+            "namespace": "production",
+            "deployment_name": "payment-api",
+            "deploy_manifest_path": "",
+            "service_yaml_path": ".titlis/service.yaml",
+            "live_deployment": {"labels": {}, "cluster": "dev"},
+        }
+
+        with patch("src.pipeline.graph.interrupt", return_value=form):
+            result = await g._resolve_manifest_path(state)
+
+        assert result["deploy_manifest_path"] == "k8s/deploy.yaml"
+        assert result["service_yaml_missing"] is True
+        assert result["generated_service_yaml"] is not None
+        parsed = _yaml.safe_load(result["generated_service_yaml"])
+        assert parsed["metadata"]["name"] == "payment-api"
+
+    @pytest.mark.asyncio
+    async def test_resume_with_string_is_legacy_fallback(self):
+        from unittest.mock import patch
+
+        g = _build_graph()
+        state = {
+            "ai_config": {"github_base_branch": "main"},
+            "repo_url": "",
+            "namespace": "production",
+            "deployment_name": "payment-api",
+            "deploy_manifest_path": "",
+            "service_yaml_path": ".titlis/service.yaml",
+            "live_deployment": {"labels": {}, "cluster": "dev"},
+        }
+
+        with patch("src.pipeline.graph.interrupt", return_value="k8s/deploy.yaml"):
+            result = await g._resolve_manifest_path(state)
+
+        assert result["deploy_manifest_path"] == "k8s/deploy.yaml"
+        assert result.get("generated_service_yaml") is None
+
+
+# ── _await_user_confirmation — files payload ──────────────────────────────────
+
+
+class TestAwaitUserConfirmationFiles:
+    @pytest.mark.asyncio
+    async def test_files_array_contains_manifest_entry(self):
+        from unittest.mock import patch
+
+        g = _build_graph()
+        state = {
+            "patched_manifest": "yaml: patched",
+            "current_manifest": "yaml: current",
+            "findings": [{"rule_id": "RES-003"}],
+            "deployment_name": "payment-api",
+            "namespace": "production",
+            "deploy_manifest_path": "k8s/deploy.yaml",
+        }
+        captured = {}
+        with patch("src.pipeline.graph.interrupt", side_effect=lambda v: captured.update(v) or True):
+            await g._await_user_confirmation(state)
+
+        assert "files" in captured
+        assert len(captured["files"]) == 1
+        assert captured["files"][0]["path"] == "k8s/deploy.yaml"
+        assert captured["files"][0]["is_new"] is False
+
+    @pytest.mark.asyncio
+    async def test_files_array_includes_service_yaml_when_generated(self):
+        from unittest.mock import patch
+
+        g = _build_graph()
+        state = {
+            "patched_manifest": "yaml: patched",
+            "current_manifest": "yaml: current",
+            "findings": [{"rule_id": "RES-003"}],
+            "deployment_name": "payment-api",
+            "namespace": "production",
+            "deploy_manifest_path": "k8s/deploy.yaml",
+            "generated_service_yaml": "metadata:\n  name: payment-api\n",
+            "service_yaml_path": ".titlis/service.yaml",
+        }
+        captured = {}
+        with patch("src.pipeline.graph.interrupt", side_effect=lambda v: captured.update(v) or True):
+            await g._await_user_confirmation(state)
+
+        assert len(captured["files"]) == 2
+        svc_entry = next(f for f in captured["files"] if f["is_new"])
+        assert svc_entry["path"] == ".titlis/service.yaml"
+        assert svc_entry["current"] == ""
