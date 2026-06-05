@@ -20,6 +20,7 @@ class ScorecardRemediationState(TypedDict, total=False):
     # ── populated by fetch_context ────────────────────────────────────────────
     rag_context: List[Dict[str, Any]]
     current_manifest: Optional[str]
+    manifest_fetch_error: Optional[str]
     live_deployment: Optional[Dict[str, Any]]
 
     # ── populated by check_existing_pr ───────────────────────────────────────

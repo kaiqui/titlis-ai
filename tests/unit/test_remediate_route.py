@@ -1,3 +1,4 @@
+import json as _json
 import time
 from unittest.mock import MagicMock, patch
 
@@ -124,6 +125,67 @@ class TestRemediateRoute:
 
         assert resp.status_code == 200
         assert "error" in resp.text
+
+    def test_fix_ready_contains_required_fields(self):
+        """fix_ready deve conter thread_id, patched_manifest e current_manifest."""
+        client = TestClient(app, raise_server_exceptions=False)
+
+        mock_graph = MagicMock()
+        mock_graph.compiled.astream = _fake_astream_fix_ready()
+        mock_graph.compiled.get_state = MagicMock(return_value=MagicMock(values={}))
+
+        with patch("src.routes.remediate.get_remediation_graph", return_value=mock_graph):
+            resp = client.post("/v1/remediate", json=_remediate_payload(), headers=_headers())
+
+        assert resp.status_code == 200
+        fix_ready_line = next(
+            (line for line in resp.text.splitlines() if "fix_ready" in line and line.startswith("data:")),
+            None,
+        )
+        assert fix_ready_line is not None, "Linha SSE com fix_ready nao encontrada"
+        event = _json.loads(fix_ready_line.removeprefix("data: "))
+        assert event["type"] == "fix_ready"
+        assert "thread_id" in event and event["thread_id"]
+        assert "patched_manifest" in event
+        assert "current_manifest" in event
+
+    def test_llm_timeout_emits_error_event(self):
+        """Se o LLM demorar mais de _LLM_CALL_TIMEOUT, deve chegar um evento error."""
+        client = TestClient(app, raise_server_exceptions=False)
+
+        async def _timeout_stream(*args, **kwargs):
+            raise RuntimeError("LLM (gemini-2.5-flash) não respondeu em 120s. Verifique a API key ou tente novamente.")
+            yield {}  # torna gerador
+
+        mock_graph = MagicMock()
+        mock_graph.compiled.astream = _timeout_stream
+
+        with patch("src.routes.remediate.get_remediation_graph", return_value=mock_graph):
+            resp = client.post("/v1/remediate", json=_remediate_payload(), headers=_headers())
+
+        assert resp.status_code == 200
+        body = resp.text
+        assert '"type": "error"' in body or '"type":"error"' in body
+        assert "120s" in body or "API key" in body
+        assert '"type": "done"' in body or '"type":"done"' in body
+
+    def test_done_emitted_after_existing_pr(self):
+        """Quando existing_pr é detectado, done deve vir após o evento existing_pr."""
+        client = TestClient(app, raise_server_exceptions=False)
+
+        mock_graph = MagicMock()
+        mock_graph.compiled.astream = _fake_astream_existing_pr()
+        mock_graph.compiled.get_state = MagicMock(return_value=MagicMock(values={}))
+
+        with patch("src.routes.remediate.get_remediation_graph", return_value=mock_graph):
+            resp = client.post("/v1/remediate", json=_remediate_payload(), headers=_headers())
+
+        assert resp.status_code == 200
+        body = resp.text
+        assert "existing_pr" in body
+        existing_pos = body.index("existing_pr")
+        done_pos = body.index('"type": "done"') if '"type": "done"' in body else body.index('"type":"done"')
+        assert done_pos > existing_pos, "done deve vir DEPOIS de existing_pr"
 
 
 class TestConfirmRemediationRoute:

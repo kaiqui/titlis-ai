@@ -257,7 +257,7 @@ class TestGenerateYamlPatch:
         state = {
             "ai_config": {"provider": "openai", "model": "gpt-4o", "api_key": "sk-test"},
             "analysis": "fix",
-            "current_manifest": "",
+            "current_manifest": "apiVersion: apps/v1\n",
             "findings": [],
             "retry_count": 0,
             "validation_errors": [],
@@ -274,7 +274,7 @@ class TestGenerateYamlPatch:
         state = {
             "ai_config": {"provider": "openai", "model": "gpt-4o", "api_key": "sk-test"},
             "analysis": "fix",
-            "current_manifest": "",
+            "current_manifest": "apiVersion: apps/v1\n",
             "findings": [],
             "retry_count": 1,
             "validation_errors": ["YAML inválido: scan error"],
@@ -397,3 +397,210 @@ class TestFetchRagContext:
         g._embedding.embed = AsyncMock(side_effect=Exception("embed failed"))
         result = await g._fetch_rag_context([{"rule_id": "RES-003"}], {"api_key": "sk-test", "provider": "openai"})
         assert result == []
+
+
+# ── _generate_yaml_patch — manifest_fetch_error ───────────────────────────────
+
+
+class TestGenerateYamlPatchManifestError:
+    @pytest.mark.asyncio
+    async def test_raises_with_manifest_fetch_error_message(self):
+        g = _build_graph()
+        state = {
+            "ai_config": {"provider": "openai", "model": "gpt-4o", "api_key": "sk-test"},
+            "analysis": "fix",
+            "current_manifest": None,
+            "manifest_fetch_error": "Branch 'release' não encontrado no repositório org/repo.",
+            "findings": [],
+            "retry_count": 0,
+            "validation_errors": [],
+            "tenant_id": 1,
+        }
+        with pytest.raises(RuntimeError, match="Branch 'release'"):
+            await g._generate_yaml_patch(state)
+
+    @pytest.mark.asyncio
+    async def test_raises_generic_message_when_no_fetch_error(self):
+        g = _build_graph()
+        state = {
+            "ai_config": {"provider": "openai", "model": "gpt-4o", "api_key": "sk-test"},
+            "analysis": "fix",
+            "current_manifest": None,
+            "manifest_fetch_error": None,
+            "deploy_manifest_path": "deploy.yaml",
+            "findings": [],
+            "retry_count": 0,
+            "validation_errors": [],
+            "tenant_id": 1,
+        }
+        with pytest.raises(RuntimeError, match="deploy.yaml"):
+            await g._generate_yaml_patch(state)
+
+
+# ── _check_existing_pr — effective_base_branch ───────────────────────────────
+
+
+class TestCheckExistingPrEffectiveBranch:
+    @pytest.mark.asyncio
+    async def test_uses_effective_base_branch_over_ai_config(self):
+        g = _build_graph()
+        prs: list = []
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.content = [MagicMock(text=json.dumps(prs))]
+        mock_session.call_tool = AsyncMock(return_value=mock_result)
+
+        with (
+            patch(
+                "src.pipeline.graph._github_session_kwargs",
+                new_callable=AsyncMock,
+                return_value={"github_token": "ghp-test"},
+            ),
+            patch("src.pipeline.graph.github_mcp_session") as mock_mcp,
+        ):
+            mock_mcp.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_mcp.return_value.__aexit__ = AsyncMock(return_value=False)
+            state = {
+                "ai_config": {"github_token": "ghp-test", "github_base_branch": "main"},
+                "effective_base_branch": "release",
+                "repo_url": "https://github.com/org/repo",
+                "namespace": "production",
+                "deployment_name": "payment-api",
+            }
+            await g._check_existing_pr(state)
+
+        call_args = mock_session.call_tool.call_args
+        assert call_args[0][1]["base"] == "release"
+
+
+# ── _sync_closed_pr_status ────────────────────────────────────────────────────
+
+
+class TestSyncClosedPrStatus:
+    @pytest.mark.asyncio
+    async def test_calls_notify_pr_closed_when_pr_is_closed_without_merge(self):
+        scorecard = AsyncMock()
+        scorecard.get_current_remediation = AsyncMock(return_value={"status": "IN_PROGRESS", "github_pr_number": 42})
+        scorecard.notify_pr_closed = AsyncMock()
+        g = _build_graph(scorecard_client=scorecard)
+
+        closed_pr_result = MagicMock()
+        closed_pr_result.isError = False
+        closed_pr_result.content = [MagicMock(text=json.dumps({"state": "closed", "merged": False}))]
+
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(return_value=closed_pr_result)
+
+        await g._sync_closed_pr_status(mock_session, "org", "repo", tenant_id=1, workload_id="uid-abc")
+
+        scorecard.notify_pr_closed.assert_called_once_with(1, "uid-abc")
+
+    @pytest.mark.asyncio
+    async def test_does_not_call_notify_when_pr_still_open(self):
+        scorecard = AsyncMock()
+        scorecard.get_current_remediation = AsyncMock(return_value={"status": "IN_PROGRESS", "github_pr_number": 42})
+        scorecard.notify_pr_closed = AsyncMock()
+        g = _build_graph(scorecard_client=scorecard)
+
+        open_pr_result = MagicMock()
+        open_pr_result.isError = False
+        open_pr_result.content = [MagicMock(text=json.dumps({"state": "open", "merged": False}))]
+
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(return_value=open_pr_result)
+
+        await g._sync_closed_pr_status(mock_session, "org", "repo", tenant_id=1, workload_id="uid-abc")
+
+        scorecard.notify_pr_closed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_call_notify_when_pr_was_merged(self):
+        scorecard = AsyncMock()
+        scorecard.get_current_remediation = AsyncMock(return_value={"status": "IN_PROGRESS", "github_pr_number": 42})
+        scorecard.notify_pr_closed = AsyncMock()
+        g = _build_graph(scorecard_client=scorecard)
+
+        merged_pr_result = MagicMock()
+        merged_pr_result.isError = False
+        merged_pr_result.content = [MagicMock(text=json.dumps({"state": "closed", "merged": True}))]
+
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(return_value=merged_pr_result)
+
+        await g._sync_closed_pr_status(mock_session, "org", "repo", tenant_id=1, workload_id="uid-abc")
+
+        scorecard.notify_pr_closed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_no_active_remediation_in_db(self):
+        scorecard = AsyncMock()
+        scorecard.get_current_remediation = AsyncMock(return_value=None)
+        scorecard.notify_pr_closed = AsyncMock()
+        g = _build_graph(scorecard_client=scorecard)
+
+        mock_session = AsyncMock()
+        await g._sync_closed_pr_status(mock_session, "org", "repo", tenant_id=1, workload_id="uid-abc")
+
+        scorecard.notify_pr_closed.assert_not_called()
+        mock_session.call_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_status_is_not_active(self):
+        scorecard = AsyncMock()
+        scorecard.get_current_remediation = AsyncMock(return_value={"status": "PR_MERGED", "github_pr_number": 42})
+        scorecard.notify_pr_closed = AsyncMock()
+        g = _build_graph(scorecard_client=scorecard)
+
+        mock_session = AsyncMock()
+        await g._sync_closed_pr_status(mock_session, "org", "repo", tenant_id=1, workload_id="uid-abc")
+
+        scorecard.notify_pr_closed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_no_pr_number(self):
+        scorecard = AsyncMock()
+        scorecard.get_current_remediation = AsyncMock(return_value={"status": "IN_PROGRESS", "github_pr_number": None})
+        scorecard.notify_pr_closed = AsyncMock()
+        g = _build_graph(scorecard_client=scorecard)
+
+        mock_session = AsyncMock()
+        await g._sync_closed_pr_status(mock_session, "org", "repo", tenant_id=1, workload_id="uid-abc")
+
+        scorecard.notify_pr_closed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_pr_number_is_zero(self):
+        scorecard = AsyncMock()
+        scorecard.get_current_remediation = AsyncMock(return_value={"status": "IN_PROGRESS", "github_pr_number": 0})
+        scorecard.notify_pr_closed = AsyncMock()
+        g = _build_graph(scorecard_client=scorecard)
+
+        mock_session = AsyncMock()
+        await g._sync_closed_pr_status(mock_session, "org", "repo", tenant_id=1, workload_id="uid-abc")
+
+        scorecard.notify_pr_closed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_status_is_null_from_db(self):
+        scorecard = AsyncMock()
+        scorecard.get_current_remediation = AsyncMock(return_value={"status": None, "github_pr_number": 42})
+        scorecard.notify_pr_closed = AsyncMock()
+        g = _build_graph(scorecard_client=scorecard)
+
+        mock_session = AsyncMock()
+        await g._sync_closed_pr_status(mock_session, "org", "repo", tenant_id=1, workload_id="uid-abc")
+
+        scorecard.notify_pr_closed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_is_resilient_to_api_errors(self):
+        scorecard = AsyncMock()
+        scorecard.get_current_remediation = AsyncMock(side_effect=Exception("network error"))
+        scorecard.notify_pr_closed = AsyncMock()
+        g = _build_graph(scorecard_client=scorecard)
+
+        mock_session = AsyncMock()
+        # não deve propagar exceção
+        await g._sync_closed_pr_status(mock_session, "org", "repo", tenant_id=1, workload_id="uid-abc")
+
+        scorecard.notify_pr_closed.assert_not_called()

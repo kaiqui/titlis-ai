@@ -1,4 +1,5 @@
 import asyncio
+import base64 as _b64
 import json
 from datetime import datetime
 from typing import Any, Dict
@@ -22,10 +23,22 @@ logger = get_logger(__name__)
 
 _MAX_RETRIES = 3
 _MCP_CALL_TIMEOUT = 30.0
+_LLM_CALL_TIMEOUT = 120.0
 
 
 async def _call_tool(session: Any, tool_name: str, args: dict) -> Any:
     return await asyncio.wait_for(session.call_tool(tool_name, args), timeout=_MCP_CALL_TIMEOUT)
+
+
+async def _call_tool_strict(session: Any, tool_name: str, args: dict) -> Any:
+    result = await _call_tool(session, tool_name, args)
+    if getattr(result, "isError", False):
+        text = ""
+        content = getattr(result, "content", None)
+        if content:
+            text = getattr(content[0], "text", "")
+        raise RuntimeError(f"GitHub MCP '{tool_name}' retornou erro: {text[:400]}")
+    return result
 
 
 async def _github_session_kwargs(ai_config: dict) -> dict:
@@ -55,6 +68,73 @@ def _mcp_text(result) -> str:
     return ""
 
 
+def _github_file_text(result) -> str:
+    raw = _mcp_text(result)
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and parsed.get("encoding") == "base64" and parsed.get("content"):
+            content = parsed["content"].replace("\n", "")
+            return _b64.b64decode(content).decode("utf-8")
+    except Exception:
+        pass
+    return raw
+
+
+def _extract_file_content(result) -> str:
+    if not result or not result.content:
+        return ""
+
+    for item in result.content:
+        # EmbeddedResource — github-mcp-server v1.0.5 retorna o conteúdo aqui
+        resource = getattr(item, "resource", None)
+        if resource is not None:
+            # TextResourceContents
+            text = getattr(resource, "text", None)
+            if text:
+                return _decode_if_base64(text)
+            # BlobResourceContents
+            blob = getattr(resource, "blob", None)
+            if blob:
+                try:
+                    return _b64.b64decode(blob).decode("utf-8")
+                except Exception:
+                    pass
+
+        # TextContent com JSON wrapper (GitHub API raw)
+        text = getattr(item, "text", None)
+        if text:
+            decoded = _github_file_text_from_str(text)
+            # Se não é a mensagem de status e parece conteúdo real
+            if decoded and not decoded.startswith("successfully"):
+                return decoded
+
+    return ""
+
+
+def _decode_if_base64(text: str) -> str:
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and parsed.get("encoding") == "base64" and parsed.get("content"):
+            return _b64.b64decode(parsed["content"].replace("\n", "")).decode("utf-8")
+    except Exception:
+        pass
+    return text
+
+
+def _github_file_text_from_str(raw: str) -> str:
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and parsed.get("encoding") == "base64" and parsed.get("content"):
+            return _b64.b64decode(parsed["content"].replace("\n", "")).decode("utf-8")
+    except Exception:
+        pass
+    return raw
+
+
 def _detect_env_from_cluster(cluster_name: str) -> str:
     name = cluster_name.lower()
     # Verifica preprod/staging antes de prod para evitar falso positivo ("preprod" contém "prod")
@@ -74,11 +154,12 @@ def _detect_env_from_cluster(cluster_name: str) -> str:
 
 def _detect_env_from_namespace(namespace: str) -> str:
     ns = namespace.lower()
+    # Verifica preprod/staging antes de "prod" para evitar falso positivo
+    if any(kw in ns for kw in ("preprod", "pre-prod", "staging", "stg", "hml", "homolog")):
+        return "hml"
     if any(kw in ns for kw in ("prod", "production")):
         return "prd"
-    if any(kw in ns for kw in ("hml", "homolog", "staging", "stg")):
-        return "hml"
-    if any(kw in ns for kw in ("dev", "develop")):
+    if any(kw in ns for kw in ("dev", "develop", "sandbox")):
         return "dev"
     return ""
 
@@ -127,7 +208,15 @@ class RemediationGraph:
         path: str = ".titlis/service.yaml",
     ) -> Dict[str, Any] | None:
         kwargs = await _github_session_kwargs(ai_config)
+        logger.info(
+            "read_service_yaml: auth_mode=%s has_token=%s has_kwargs=%s path=%s",
+            ai_config.get("github_auth_mode", "?"),
+            bool(ai_config.get("github_token")),
+            bool(kwargs),
+            path,
+        )
         if not kwargs:
+            logger.warning("read_service_yaml: sem credenciais GitHub — token não configurado ou vazio")
             return None
         try:
             owner, name = _parse_repo(repo_url)
@@ -137,24 +226,30 @@ class RemediationGraph:
                     "get_file_contents",
                     {"owner": owner, "repo": name, "path": path},
                 )
-                if getattr(result, "isError", False):
+                is_err = getattr(result, "isError", False)
+                logger.info("read_service_yaml: get_file_contents isError=%s", is_err)
+                if is_err:
                     content = getattr(result, "content", None)
                     err_text = getattr(content[0], "text", "") if content else ""
-                    if "not found" in err_text.lower() or "404" in err_text:
-                        logger.debug("service.yaml não existe no repo", extra={"repo": f"{owner}/{name}", "path": path})
-                    else:
-                        logger.warning(
-                            "Repo não acessível — PAT pode não ter scope 'repo' para repo privado",
-                            extra={"repo": f"{owner}/{name}", "error": err_text[:120]},
-                        )
+                    logger.warning(
+                        "read_service_yaml: MCP error — %s",
+                        err_text[:200],
+                        extra={"repo": f"{owner}/{name}", "path": path},
+                    )
                     return None
-                text = _mcp_text(result)
+                text = _extract_file_content(result)
+                logger.info("read_service_yaml: content_len=%d", len(text))
                 if text:
-                    return yaml.safe_load(text)
+                    parsed = yaml.safe_load(text)
+                    has_spec = isinstance(parsed, dict) and "spec" in parsed
+                    logger.info("read_service_yaml: parsed OK has_spec=%s", has_spec)
+                    return parsed
+                logger.warning("read_service_yaml: conteúdo não encontrado no resultado do MCP")
         except Exception as exc:
             logger.warning(
-                ".titlis/service.yaml não acessível",
-                extra={"repo_url": repo_url, "error": str(exc)[:120]},
+                "read_service_yaml: exception — %s",
+                str(exc)[:200],
+                extra={"repo_url": repo_url, "path": path},
             )
         return None
 
@@ -234,11 +329,12 @@ class RemediationGraph:
         rag_task = self._fetch_rag_context(findings, ai_config)
         manifest_task = self._fetch_manifest(repo_url, base_branch, path, ai_config)
 
-        rag_chunks, current_manifest = await asyncio.gather(rag_task, manifest_task)
+        rag_chunks, (current_manifest, manifest_error) = await asyncio.gather(rag_task, manifest_task)
 
         return {
             "rag_context": rag_chunks,
             "current_manifest": current_manifest,
+            "manifest_fetch_error": manifest_error,
         }
 
     async def _fetch_rag_context(self, findings, ai_config):
@@ -256,10 +352,12 @@ class RemediationGraph:
             logger.warning("RAG falhou no pipeline de remediação")
             return []
 
-    async def _fetch_manifest(self, repo_url, branch, path, ai_config):
+    async def _fetch_manifest(self, repo_url, branch, path, ai_config) -> tuple[str | None, str | None]:
         kwargs = await _github_session_kwargs(ai_config)
         if not kwargs or not repo_url:
-            return None
+            msg = "Token GitHub não configurado — acesse Configurações → Integrações."
+            logger.warning("Token GitHub ausente — não é possível ler o manifesto")
+            return None, msg
         try:
             owner, name = _parse_repo(repo_url)
             async with github_mcp_session(**kwargs) as session:
@@ -268,10 +366,37 @@ class RemediationGraph:
                     "get_file_contents",
                     {"owner": owner, "repo": name, "path": path, "ref": branch},
                 )
-                return _mcp_text(result) or None
-        except Exception:
-            logger.warning("Falha ao ler manifest via MCP GitHub", extra={"path": path})
-            return None
+                if getattr(result, "isError", False):
+                    err_text = _mcp_text(result)
+                    logger.error(
+                        "MCP get_file_contents retornou erro",
+                        extra={"path": path, "branch": branch, "repo": f"{owner}/{name}", "error": err_text[:300]},
+                    )
+                    if "could not resolve ref" in err_text or "does not exist" in err_text.lower():
+                        msg = (
+                            f"Branch '{branch}' não encontrado no repositório {owner}/{name}. "
+                            f"Verifique se o branch existe ou corrija o arquivo .titlis/service.yaml "
+                            f"(configuração para o ambiente detectado)."
+                        )
+                    else:
+                        msg = (
+                            f"Não foi possível ler '{path}' (branch: {branch}) em {owner}/{name}. "
+                            f"Verifique se o caminho está correto e se o token tem permissão de leitura."
+                        )
+                    return None, msg
+                text = _extract_file_content(result)
+                if not text:
+                    logger.warning("Manifesto vazio ou não encontrado", extra={"path": path, "branch": branch})
+                    return None, f"Arquivo '{path}' (branch: {branch}) está vazio ou não encontrado em {owner}/{name}."
+                logger.info("Manifesto lido com sucesso", extra={"path": path, "chars": len(text)})
+                return text, None
+        except Exception as exc:
+            err_str = str(exc)[:300]
+            logger.error(
+                "Exceção ao ler manifest via MCP GitHub",
+                extra={"path": path, "branch": branch, "error": err_str},
+            )
+            return None, f"Erro ao ler o manifesto de {repo_url} (branch: {branch}, path: {path}): {err_str}"
 
     async def _check_existing_pr(self, state: ScorecardRemediationState) -> Dict[str, Any]:
         ai_config = state.get("ai_config", {})
@@ -279,7 +404,9 @@ class RemediationGraph:
         repo_url = state.get("repo_url", "")
         namespace = state.get("namespace", "")
         deployment_name = state.get("deployment_name", "")
-        base_branch = ai_config.get("github_base_branch", "main")
+        tenant_id = state.get("tenant_id", 0)
+        workload_id = state.get("workload_id", "")
+        base_branch = state.get("effective_base_branch") or ai_config.get("github_base_branch", "main")
 
         if not kwargs or not repo_url:
             return {"existing_pr": None}
@@ -306,10 +433,59 @@ class RemediationGraph:
                                 "branch": head_ref,
                             }
                         }
+
+                # Nenhum PR aberto com o prefixo — verifica se o DB tem um registro ativo
+                # cujo PR foi fechado sem merge e sincroniza o status.
+                await self._sync_closed_pr_status(session, owner, name, tenant_id, workload_id)
         except Exception:
             logger.warning("Falha ao verificar PR existente via MCP GitHub")
 
         return {"existing_pr": None}
+
+    async def _sync_closed_pr_status(
+        self,
+        session: Any,
+        owner: str,
+        repo: str,
+        tenant_id: int,
+        workload_id: str,
+    ) -> None:
+        if not tenant_id or not workload_id:
+            return
+        try:
+            current = await self._scorecard.get_current_remediation(tenant_id, workload_id)
+            if not current:
+                return
+            status = current.get("status") or ""
+            pr_number = current.get("github_pr_number") or None
+            if status not in ("IN_PROGRESS", "PR_OPEN") or not pr_number:
+                return
+
+            pr_result = await _call_tool(
+                session,
+                "get_pull_request",
+                {"owner": owner, "repo": repo, "pullNumber": pr_number},
+            )
+            if getattr(pr_result, "isError", False):
+                return
+
+            pr_raw = _mcp_text(pr_result)
+            try:
+                pr_data = json.loads(pr_raw)
+            except Exception:
+                return
+
+            if pr_data.get("state") == "closed" and not pr_data.get("merged", False):
+                logger.info(
+                    "PR fechado sem merge detectado — atualizando status para PR_CLOSED",
+                    extra={"pr_number": pr_number, "workload_id": workload_id, "tenant_id": tenant_id},
+                )
+                await self._scorecard.notify_pr_closed(tenant_id, workload_id)
+        except Exception as exc:
+            logger.warning(
+                "Falha ao sincronizar status de PR fechado",
+                extra={"workload_id": workload_id, "error": str(exc)[:200]},
+            )
 
     async def _analyze_findings(self, state: ScorecardRemediationState) -> Dict[str, Any]:
         ai_config = state.get("ai_config", {})
@@ -347,7 +523,34 @@ class RemediationGraph:
             },
         ]
 
-        analysis = await self._llm.chat(messages, _to_ai_config(ai_config), state.get("tenant_id", 0))
+        import time as _time
+
+        tenant_id = state.get("tenant_id", 0)
+        model = ai_config.get("model", "?")
+        logger.info(
+            "LLM analyze_findings: iniciando",
+            extra={"tenant_id": tenant_id, "model": model, "findings_count": len(findings)},
+        )
+        _t0 = _time.monotonic()
+        try:
+            analysis = await asyncio.wait_for(
+                self._llm.chat(messages, _to_ai_config(ai_config), tenant_id),
+                timeout=_LLM_CALL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            elapsed = _time.monotonic() - _t0
+            logger.error(
+                "LLM analyze_findings: timeout",
+                extra={"tenant_id": tenant_id, "model": model, "elapsed_s": round(elapsed, 1)},
+            )
+            raise RuntimeError(
+                f"LLM ({model}) não respondeu em {int(_LLM_CALL_TIMEOUT)}s. Verifique a API key ou tente novamente."
+            )
+        elapsed = _time.monotonic() - _t0
+        logger.info(
+            "LLM analyze_findings: concluído",
+            extra={"tenant_id": tenant_id, "model": model, "elapsed_s": round(elapsed, 1)},
+        )
         return {"analysis": analysis}
 
     @staticmethod
@@ -373,6 +576,16 @@ class RemediationGraph:
         deployment_name = state.get("deployment_name", "")
         retry_count = state.get("retry_count", 0)
         validation_errors = state.get("validation_errors", [])
+
+        if not current_manifest:
+            fetch_error = state.get("manifest_fetch_error")
+            if fetch_error:
+                raise RuntimeError(fetch_error)
+            path = state.get("deploy_manifest_path", "desconhecido")
+            raise RuntimeError(
+                f"Não foi possível ler o manifesto atual do GitHub (path: {path}). "
+                "Verifique se o caminho está correto e se o token tem permissão de leitura no repositório."
+            )
 
         error_feedback = ""
         if validation_errors:
@@ -405,13 +618,15 @@ class RemediationGraph:
             {
                 "role": "system",
                 "content": (
-                    "Você é um especialista em Kubernetes. Gere APENAS o conteúdo YAML corrigido do deploy.yaml. "
-                    "Não adicione explicações, comentários ou blocos de código markdown. "
-                    "Retorne SOMENTE o YAML válido. "
-                    "NUNCA reduza valores de cpu ou memory — apenas aumente ou adicione. "
-                    "CRÍTICO: altere SOMENTE os campos necessários para corrigir os findings listados. "
-                    "Mantenha TODOS os outros campos exatamente como estão no manifest atual — "
-                    "não adicione, remova nem renomeie nenhum outro campo além do que os findings exigem."
+                    "Você é um especialista em Kubernetes. "
+                    "Sua tarefa é retornar o conteúdo COMPLETO E INTEGRAL do arquivo deploy.yaml após aplicar as correções. "
+                    "REGRAS ABSOLUTAS:\n"
+                    "1. Retorne TODOS os documentos YAML do arquivo, separados por '---', exatamente como no original. "
+                    "Não remova nenhum recurso (Deployment, Service, HPA, ConfigMap, Secret, Ingress, etc.).\n"
+                    "2. Altere SOMENTE os campos necessários para corrigir os findings listados dentro do Deployment alvo. "
+                    "Todos os outros campos, em todos os recursos, devem ser idênticos ao original.\n"
+                    "3. NUNCA reduza valores de cpu, memory ou replicas — apenas aumente ou adicione.\n"
+                    "4. Não adicione explicações, comentários extras ou blocos markdown. Retorne apenas YAML válido.\n"
                     f"{multi_deployment_guard}"
                 ),
             },
@@ -421,14 +636,40 @@ class RemediationGraph:
                     f"**Deployment alvo:** `{deployment_name}` (namespace: `{state.get('namespace', '')}`)\n\n"
                     f"**Análise:**\n{analysis}\n\n"
                     f"**Findings a corrigir:**\n{findings_str}\n\n"
-                    f"**Manifest atual:**\n{current_manifest or 'não disponível'}"
-                    f"{error_feedback}\n\n"
-                    "Retorne o deploy.yaml completo e corrigido."
+                    f"**Arquivo atual (retorne-o COMPLETO com todos os recursos, apenas corrigindo os findings acima):**\n"
+                    f"{current_manifest or 'não disponível'}"
+                    f"{error_feedback}"
                 ),
             },
         ]
 
-        patched = await self._llm.chat(messages, _to_ai_config(ai_config), state.get("tenant_id", 0))
+        import time as _time
+
+        tenant_id = state.get("tenant_id", 0)
+        model = ai_config.get("model", "?")
+        logger.info(
+            "LLM generate_yaml_patch: iniciando", extra={"tenant_id": tenant_id, "model": model, "retry": retry_count}
+        )
+        _t0 = _time.monotonic()
+        try:
+            patched = await asyncio.wait_for(
+                self._llm.chat(messages, _to_ai_config(ai_config), tenant_id),
+                timeout=_LLM_CALL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            elapsed = _time.monotonic() - _t0
+            logger.error(
+                "LLM generate_yaml_patch: timeout",
+                extra={"tenant_id": tenant_id, "model": model, "elapsed_s": round(elapsed, 1)},
+            )
+            raise RuntimeError(
+                f"LLM ({model}) não respondeu em {int(_LLM_CALL_TIMEOUT)}s ao gerar patch. Verifique a API key."
+            )
+        elapsed = _time.monotonic() - _t0
+        logger.info(
+            "LLM generate_yaml_patch: concluído",
+            extra={"tenant_id": tenant_id, "model": model, "elapsed_s": round(elapsed, 1)},
+        )
         patched = patched.strip()
         if patched.startswith("```"):
             lines = patched.splitlines()
@@ -504,13 +745,22 @@ class RemediationGraph:
             + "\n\n*Gerado pelo Titlis AI Assistant*"
         )
 
+        if not kwargs:
+            raise RuntimeError("Token GitHub não configurado — acesse Configurações › Integrações")
+
+        if not patched.strip():
+            raise RuntimeError("Patch YAML está vazio — nenhuma alteração a commitar")
+
         async with github_mcp_session(**kwargs) as session:
-            await _call_tool(
+            logger.info("Criando branch", extra={"branch": branch_name, "base": base_branch})
+            await _call_tool_strict(
                 session,
                 "create_branch",
                 {"owner": owner, "repo": name, "branch": branch_name, "from_branch": base_branch},
             )
-            await _call_tool(
+
+            logger.info("Fazendo push do manifesto", extra={"path": path, "branch": branch_name})
+            await _call_tool_strict(
                 session,
                 "push_files",
                 {
@@ -521,7 +771,9 @@ class RemediationGraph:
                     "files": [{"path": path, "content": patched}],
                 },
             )
-            result = await _call_tool(
+
+            logger.info("Criando Pull Request", extra={"branch": branch_name, "base": base_branch})
+            result = await _call_tool_strict(
                 session,
                 "create_pull_request",
                 {
@@ -535,10 +787,19 @@ class RemediationGraph:
                 },
             )
 
-        pr_data = json.loads(_mcp_text(result) or "{}")
+        raw = _mcp_text(result) or ""
+        try:
+            pr_data = json.loads(raw)
+        except Exception:
+            pr_data = {}
+
+        pr_url = pr_data.get("html_url", "")
+        if not pr_url:
+            raise RuntimeError(f"create_pull_request não retornou URL — resposta do MCP: {raw[:400]}")
+
         return {
             "pr_result": {
-                "pr_url": pr_data.get("html_url", ""),
+                "pr_url": pr_url,
                 "pr_number": pr_data.get("number", 0),
                 "branch": branch_name,
             }

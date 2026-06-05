@@ -134,6 +134,25 @@ class ScorecardClient:
         )
         resp.raise_for_status()
 
+    async def get_current_remediation(self, tenant_id: int, k8s_uid: str) -> Optional[Dict[str, Any]]:
+        resp = await self._get(
+            "/v1/internal/ai/remediations/current",
+            {"tenantId": tenant_id, "k8sUid": k8s_uid},
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+    async def notify_pr_closed(self, tenant_id: int, k8s_uid: str) -> None:
+        resp = await self._post(
+            "/v1/internal/ai/remediations/close-pr",
+            json={"workloadId": k8s_uid, "tenantId": tenant_id},
+        )
+        if resp.status_code == 404:
+            return
+        resp.raise_for_status()
+
     async def notify_remediation_started(
         self,
         tenant_id: int,
