@@ -61,6 +61,12 @@ spec:
         - name: titlis-ai
           image: __DOCKERHUB_USER__/titlis-ai:__IMAGE_TAG__
           imagePullPolicy: __IMAGE_PULL_POLICY__
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           ports:
             - containerPort: 8001
               name: http
@@ -107,3 +113,23 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: titlis-ai
+  namespace: __NAMESPACE__
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: titlis-ai
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
