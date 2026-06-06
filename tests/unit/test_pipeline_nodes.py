@@ -674,8 +674,63 @@ class TestRenderServiceYaml:
 
 class TestResolveManifestPathServiceYamlRequired:
     @pytest.mark.asyncio
-    async def test_resume_with_dict_generates_service_yaml(self):
+    async def test_resume_with_json_string_generates_service_yaml(self):
+        import json
         import yaml as _yaml
+        from unittest.mock import patch
+
+        g = _build_graph()
+        form = {
+            "path": "k8s/deploy.yaml",
+            "base_branch": "main",
+            "name": "payment-api",
+            "team": "payments",
+            "namespaces": ["production"],
+            "name_pattern": "^payment-api$",
+            "env": "prd",
+        }
+        state = {
+            "ai_config": {"github_base_branch": "main"},
+            "repo_url": "",
+            "namespace": "production",
+            "deployment_name": "payment-api",
+            "deploy_manifest_path": "",
+            "service_yaml_path": ".titlis/service.yaml",
+            "live_deployment": {"labels": {}, "cluster": "dev"},
+        }
+
+        with patch("src.pipeline.graph.interrupt", return_value=json.dumps(form)):
+            result = await g._resolve_manifest_path(state)
+
+        assert result["deploy_manifest_path"] == "k8s/deploy.yaml"
+        assert result["service_yaml_missing"] is True
+        assert result["generated_service_yaml"] is not None
+        parsed = _yaml.safe_load(result["generated_service_yaml"])
+        assert parsed["metadata"]["name"] == "payment-api"
+
+    @pytest.mark.asyncio
+    async def test_resume_with_plain_string_is_legacy_fallback(self):
+        from unittest.mock import patch
+
+        g = _build_graph()
+        state = {
+            "ai_config": {"github_base_branch": "main"},
+            "repo_url": "",
+            "namespace": "production",
+            "deployment_name": "payment-api",
+            "deploy_manifest_path": "",
+            "service_yaml_path": ".titlis/service.yaml",
+            "live_deployment": {"labels": {}, "cluster": "dev"},
+        }
+
+        with patch("src.pipeline.graph.interrupt", return_value="k8s/deploy.yaml"):
+            result = await g._resolve_manifest_path(state)
+
+        assert result["deploy_manifest_path"] == "k8s/deploy.yaml"
+        assert result.get("generated_service_yaml") is None
+
+    @pytest.mark.asyncio
+    async def test_resume_with_plain_dict_still_works_as_compat(self):
         from unittest.mock import patch
 
         g = _build_graph()
@@ -701,32 +756,9 @@ class TestResolveManifestPathServiceYamlRequired:
         with patch("src.pipeline.graph.interrupt", return_value=form):
             result = await g._resolve_manifest_path(state)
 
+        # compat defensivo: dict direto ainda deve funcionar
         assert result["deploy_manifest_path"] == "k8s/deploy.yaml"
         assert result["service_yaml_missing"] is True
-        assert result["generated_service_yaml"] is not None
-        parsed = _yaml.safe_load(result["generated_service_yaml"])
-        assert parsed["metadata"]["name"] == "payment-api"
-
-    @pytest.mark.asyncio
-    async def test_resume_with_string_is_legacy_fallback(self):
-        from unittest.mock import patch
-
-        g = _build_graph()
-        state = {
-            "ai_config": {"github_base_branch": "main"},
-            "repo_url": "",
-            "namespace": "production",
-            "deployment_name": "payment-api",
-            "deploy_manifest_path": "",
-            "service_yaml_path": ".titlis/service.yaml",
-            "live_deployment": {"labels": {}, "cluster": "dev"},
-        }
-
-        with patch("src.pipeline.graph.interrupt", return_value="k8s/deploy.yaml"):
-            result = await g._resolve_manifest_path(state)
-
-        assert result["deploy_manifest_path"] == "k8s/deploy.yaml"
-        assert result.get("generated_service_yaml") is None
 
 
 # ── _await_user_confirmation — files payload ──────────────────────────────────
@@ -778,3 +810,75 @@ class TestAwaitUserConfirmationFiles:
         svc_entry = next(f for f in captured["files"] if f["is_new"])
         assert svc_entry["path"] == ".titlis/service.yaml"
         assert svc_entry["current"] == ""
+
+    @pytest.mark.asyncio
+    async def test_guard_raises_on_dict_resume(self):
+        from unittest.mock import patch
+
+        g = _build_graph()
+        state = {
+            "patched_manifest": "yaml: patched",
+            "current_manifest": "yaml: current",
+            "findings": [],
+            "deployment_name": "payment-api",
+            "namespace": "production",
+            "deploy_manifest_path": "k8s/deploy.yaml",
+        }
+        # Simula LangGraph vazando o form_dict como resume value
+        leaked_form = {"path": "k8s/deploy.yaml", "name": "payment-api"}
+        with patch("src.pipeline.graph.interrupt", return_value=leaked_form):
+            with pytest.raises(RuntimeError, match="inválida"):
+                await g._await_user_confirmation(state)
+
+    @pytest.mark.asyncio
+    async def test_guard_raises_on_string_resume(self):
+        from unittest.mock import patch
+
+        g = _build_graph()
+        state = {
+            "patched_manifest": "yaml: patched",
+            "current_manifest": "yaml: current",
+            "findings": [],
+            "deployment_name": "payment-api",
+            "namespace": "production",
+            "deploy_manifest_path": "k8s/deploy.yaml",
+        }
+        with patch("src.pipeline.graph.interrupt", return_value="some_path"):
+            with pytest.raises(RuntimeError, match="inválida"):
+                await g._await_user_confirmation(state)
+
+    @pytest.mark.asyncio
+    async def test_guard_accepts_true_boolean_resume(self):
+        from unittest.mock import patch
+
+        g = _build_graph()
+        state = {
+            "patched_manifest": "yaml: patched",
+            "current_manifest": "yaml: current",
+            "findings": [],
+            "deployment_name": "payment-api",
+            "namespace": "production",
+            "deploy_manifest_path": "k8s/deploy.yaml",
+        }
+        with patch("src.pipeline.graph.interrupt", return_value=True):
+            result = await g._await_user_confirmation(state)
+
+        assert result == {"approved": True}
+
+    @pytest.mark.asyncio
+    async def test_guard_accepts_false_boolean_resume(self):
+        from unittest.mock import patch
+
+        g = _build_graph()
+        state = {
+            "patched_manifest": "yaml: patched",
+            "current_manifest": "yaml: current",
+            "findings": [],
+            "deployment_name": "payment-api",
+            "namespace": "production",
+            "deploy_manifest_path": "k8s/deploy.yaml",
+        }
+        with patch("src.pipeline.graph.interrupt", return_value=False):
+            result = await g._await_user_confirmation(state)
+
+        assert result == {"approved": False}

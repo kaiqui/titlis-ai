@@ -1,8 +1,9 @@
 import asyncio
 import base64 as _b64
 import json
+import re
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml  # type: ignore[import-untyped]
 from langgraph.checkpoint.memory import MemorySaver
@@ -16,7 +17,7 @@ from src.infrastructure.titlis_api.knowledge_client import KnowledgeClient
 from src.pipeline.state import ScorecardRemediationState
 from src.services.embedding_service import EmbeddingService
 from src.services.llm_service import LLMService
-from src.tools.github_tools import _never_reduce_violated, _parse_repo
+from src.tools.github_tools import _check_never_reduce, _never_reduce_violated, _parse_repo
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -349,11 +350,25 @@ class RemediationGraph:
             }
         )
 
-        if isinstance(form, dict):
-            generated_yaml = _render_service_yaml(form)
+        # LangGraph 0.3.5: Command(resume=dict) pode vazar para interrupts subsequentes.
+        # Por isso o resume value é sempre uma JSON string — desserializamos aqui.
+        form_data: Optional[dict] = None
+        if isinstance(form, str):
+            try:
+                parsed = json.loads(form)
+                if isinstance(parsed, dict):
+                    form_data = parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+        elif isinstance(form, dict):
+            # compat defensivo: se vier dict mesmo assim, aceita
+            form_data = form
+
+        if form_data is not None:
+            generated_yaml = _render_service_yaml(form_data)
             return {
-                "deploy_manifest_path": form.get("path", suggested_path),
-                "effective_base_branch": form.get("base_branch") or base_branch,
+                "deploy_manifest_path": form_data.get("path", suggested_path),
+                "effective_base_branch": form_data.get("base_branch") or base_branch,
                 "detected_environment": env,
                 "generated_service_yaml": generated_yaml,
                 "service_yaml_missing": True,
@@ -361,7 +376,7 @@ class RemediationGraph:
                 "service_yaml_prefill": prefill,
             }
 
-        # fallback de segurança se resume for uma string (caminho direto legado)
+        # fallback: string simples = caminho direto do manifesto (legado)
         return {
             "deploy_manifest_path": str(form),
             "detected_environment": env,
@@ -420,7 +435,12 @@ class RemediationGraph:
                         "MCP get_file_contents retornou erro",
                         extra={"path": path, "branch": branch, "repo": f"{owner}/{name}", "error": err_text[:300]},
                     )
-                    if "could not resolve ref" in err_text or "does not exist" in err_text.lower():
+                    lower = err_text.lower()
+                    is_ref_error = (
+                        "could not resolve ref" in lower
+                        or "no commit found for the ref" in lower
+                    )
+                    if is_ref_error:
                         msg = (
                             f"Branch '{branch}' não encontrado no repositório {owner}/{name}. "
                             f"Verifique se o branch existe ou corrija o arquivo .titlis/service.yaml "
@@ -429,7 +449,8 @@ class RemediationGraph:
                     else:
                         msg = (
                             f"Não foi possível ler '{path}' (branch: {branch}) em {owner}/{name}. "
-                            f"Verifique se o caminho está correto e se o token tem permissão de leitura."
+                            f"Verifique se o arquivo existe nesse branch e se o token tem permissão de leitura. "
+                            f"Detalhe: {err_text[:200]}"
                         )
                     return None, msg
                 text = _extract_file_content(result)
@@ -474,10 +495,13 @@ class RemediationGraph:
                 for pr in prs:
                     head_ref = pr.get("head", {}).get("ref", "")
                     if head_ref.startswith(branch_prefix):
+                        existing_url = pr.get("html_url") or pr.get("url", "")
+                        m = re.search(r"/pull/(\d+)$", existing_url)
+                        existing_number = int(m.group(1)) if m else (pr.get("number") or 0)
                         return {
                             "existing_pr": {
-                                "pr_url": pr["html_url"],
-                                "pr_number": pr["number"],
+                                "pr_url": existing_url,
+                                "pr_number": existing_number,
                                 "branch": head_ref,
                             }
                         }
@@ -536,6 +560,10 @@ class RemediationGraph:
             )
 
     async def _analyze_findings(self, state: ScorecardRemediationState) -> Dict[str, Any]:
+        fetch_error = state.get("manifest_fetch_error")
+        if fetch_error:
+            raise RuntimeError(fetch_error)
+
         ai_config = state.get("ai_config", {})
         findings = state.get("findings", [])
         rag_context = state.get("rag_context", [])
@@ -735,26 +763,15 @@ class RemediationGraph:
         errors = []
 
         try:
-            yaml.safe_load(patched)
+            list(yaml.safe_load_all(patched))
         except yaml.YAMLError as exc:
             errors.append(f"YAML inválido: {exc}")
             return {"validation_errors": errors}
 
         if current:
-            current_lines = {
-                line.strip().split(":")[0]: line.split(":", 1)[-1].strip().strip('"').strip("'")
-                for line in current.splitlines()
-                if ":" in line and line.strip().startswith(("cpu:", "memory:"))
-            }
-            for line in patched.splitlines():
-                if ":" not in line:
-                    continue
-                key = line.strip().split(":")[0]
-                if key in ("cpu", "memory"):
-                    new_val = line.split(":", 1)[-1].strip().strip('"').strip("'")
-                    old_val = current_lines.get(key, "")
-                    if old_val and new_val and _never_reduce_violated(old_val, new_val):
-                        errors.append(f"never-reduce violado: {key} {old_val} → {new_val}")
+            violation = _check_never_reduce(current, patched)
+            if violation:
+                errors.append(violation)
 
         return {"validation_errors": errors}
 
@@ -786,7 +803,14 @@ class RemediationGraph:
                 "files": files,
             }
         )
-        return {"approved": bool(approved)}
+        # Guard: resume deve ser booleano (True = aprovar, False = rejeitar).
+        # Valor diferente indica bug de LangGraph vazando o resume de outro interrupt.
+        if not isinstance(approved, bool):
+            raise RuntimeError(
+                "Sessão de remediação inválida (estado interno corrompido). "
+                "Feche esta janela e inicie uma nova remediação."
+            )
+        return {"approved": approved}
 
     async def _create_remediation_pr(self, state: ScorecardRemediationState) -> Dict[str, Any]:
         ai_config = state.get("ai_config", {})
@@ -794,7 +818,7 @@ class RemediationGraph:
         base_branch = state.get("effective_base_branch") or ai_config.get("github_base_branch", "main")
         repo_url = state.get("repo_url", "")
         path = state.get("deploy_manifest_path", "deploy.yaml")
-        patched = state.get("patched_manifest", "")
+        patched = state.get("patched_manifest") or ""
         findings = [f.get("rule_id", "") for f in state.get("findings", [])]
         namespace = state.get("namespace", "")
         deployment_name = state.get("deployment_name", "")
@@ -833,7 +857,7 @@ class RemediationGraph:
                 files_to_push.append(
                     {
                         "path": state.get("service_yaml_path") or ".titlis/service.yaml",
-                        "content": state["generated_service_yaml"],
+                        "content": state.get("generated_service_yaml") or "",
                     }
                 )
             logger.info(
@@ -873,34 +897,50 @@ class RemediationGraph:
         except Exception:
             pr_data = {}
 
-        pr_url = pr_data.get("html_url", "")
+        pr_url = pr_data.get("html_url") or pr_data.get("url", "")
         if not pr_url:
             raise RuntimeError(f"create_pull_request não retornou URL — resposta do MCP: {raw[:400]}")
+        m = re.search(r"/pull/(\d+)$", pr_url)
+        pr_number = int(m.group(1)) if m else (pr_data.get("number") or 0)
 
         return {
             "pr_result": {
                 "pr_url": pr_url,
-                "pr_number": pr_data.get("number", 0),
+                "pr_number": pr_number,
                 "branch": branch_name,
             }
         }
 
     async def _notify_api(self, state: ScorecardRemediationState) -> Dict[str, Any]:
         pr = state.get("pr_result", {}) or {}
+        tenant_id = state.get("tenant_id", 0)
+        workload_id = state.get("workload_id", "")
+        pr_url = pr.get("pr_url")
+        pr_number = pr.get("pr_number")
         try:
             await self._scorecard.notify_remediation_started(
-                tenant_id=state.get("tenant_id", 0),
-                workload_id=state.get("workload_id", ""),
-                pr_url=pr.get("pr_url"),
-                pr_number=pr.get("pr_number"),
+                tenant_id=tenant_id,
+                workload_id=workload_id,
+                pr_url=pr_url,
+                pr_number=pr_number,
                 github_branch=pr.get("branch"),
                 repo_url=state.get("repo_url"),
                 finding_ids=[f.get("rule_id", "") for f in state.get("findings", [])],
             )
-        except Exception:
-            logger.exception(
-                "Falha ao notificar API sobre remediação iniciada",
-                extra={"workload_id": state.get("workload_id"), "tenant_id": state.get("tenant_id")},
+            logger.info(
+                "Remediação registrada na API",
+                extra={"workload_id": workload_id, "tenant_id": tenant_id, "pr_number": pr_number, "pr_url": pr_url},
+            )
+        except Exception as exc:
+            logger.error(
+                "Falha ao registrar remediação na API — PR criado mas não registrado",
+                extra={
+                    "workload_id": workload_id,
+                    "tenant_id": tenant_id,
+                    "pr_url": pr_url,
+                    "pr_number": pr_number,
+                    "error": str(exc)[:300],
+                },
             )
         return {}
 

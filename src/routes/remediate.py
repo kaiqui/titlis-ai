@@ -8,7 +8,12 @@ from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 
 from src.bootstrap.dependencies import get_remediation_graph
-from src.domain.models import ConfirmRemediationRequest, RemediateRequest, SetManifestPathRequest, SubmitServiceYamlRequest
+from src.domain.models import (
+    ConfirmRemediationRequest,
+    RemediateRequest,
+    SetManifestPathRequest,
+    SubmitServiceYamlRequest,
+)
 from src.observability.langfuse_handler import get_langfuse_callbacks
 from src.observability.metrics import (
     ai_latency_seconds,
@@ -345,11 +350,14 @@ async def submit_service_yaml(
     if body.extra_paths:
         form_dict["extra_paths"] = body.extra_paths
 
+    # LangGraph 0.3.5: Command(resume=dict) pode ser aplicado a interrupts subsequentes,
+    # causando _await_user_confirmation retornar True acidentalmente. Serializamos como
+    # JSON string para que o grafo receba sempre um escalar seguro.
+    form_json = json.dumps(form_dict)
+
     async def _inner() -> AsyncGenerator[str, None]:
         try:
-            async for event in graph.compiled.astream(
-                Command(resume=form_dict), config, stream_mode="updates"
-            ):
+            async for event in graph.compiled.astream(Command(resume=form_json), config, stream_mode="updates"):
                 if "__interrupt__" in event:
                     _thread_interrupt_times[thread_id] = time.time()
                     interrupt_val = event["__interrupt__"][0].value

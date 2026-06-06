@@ -324,7 +324,12 @@ class TestSubmitServiceYamlRoute:
                             "deployment_name": "payment-api",
                             "namespace": "production",
                             "files": [
-                                {"path": "k8s/deploy.yaml", "current": "yaml: current", "patched": "yaml: patched", "is_new": False}
+                                {
+                                    "path": "k8s/deploy.yaml",
+                                    "current": "yaml: current",
+                                    "patched": "yaml: patched",
+                                    "is_new": False,
+                                }
                             ],
                         }
                     )
