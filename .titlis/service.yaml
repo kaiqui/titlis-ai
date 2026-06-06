@@ -1,0 +1,16 @@
+metadata:
+  name: titlis-ai
+  workload_match:
+    namespaces:
+    - titlis-preprod
+    name_pattern: ^titlis-ai$
+spec:
+  owner:
+    team: sre
+  gitops:
+    paths:
+      prd:
+        path: manifest/kubernetes/main/deploy.yaml
+        base_branch: main
+  remediation:
+    enabled: true
